@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "integritycore"
+version = "0.1.0"
+description = "A cloud-agnostic, pip-installable agentic framework for mathematical ETL verification."
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "z3-solver",
+    "google-adk",
+    "litellm",
+    "streamlit",
+    "fastmcp",
+    "google-cloud-secret-manager"
+]
+
+[project.scripts]
+integrity-core = "integritycore.cli:main"
+integrity-ui = "integritycore.cli:run_ui"
