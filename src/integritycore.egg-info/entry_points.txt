@@ -1,0 +1,3 @@
+[console_scripts]
+integrity-core = integritycore.cli:main
+integrity-ui = integritycore.cli:run_ui

@@ -13,7 +13,8 @@ dependencies = [
     "z3-solver",
     "google-adk",
     "litellm",
-    "streamlit",
+    "fastapi",
+    "uvicorn",
     "fastmcp",
     "google-cloud-secret-manager"
 ]

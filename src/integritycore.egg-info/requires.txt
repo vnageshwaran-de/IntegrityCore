@@ -1,0 +1,7 @@
+z3-solver
+google-adk
+litellm
+fastapi
+uvicorn
+fastmcp
+google-cloud-secret-manager

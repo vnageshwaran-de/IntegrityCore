@@ -34,16 +34,21 @@ class LoopAgent:
         }]
         return self.tools
 
-    def execute_etl_loop(self, prompt: str, strategy: ETLStrategy, max_retries: int = 3) -> str:
+    def execute_etl_loop(self, prompt: str, strategy: ETLStrategy, source: str = "POSTGRESQL", target: str = "SNOWFLAKE", max_retries: int = 3) -> str:
         """
         The core Multi-Agent orchestration cycle: Generate -> Verify -> Repair
+        Includes Source and Target connection mapping to ensure accurate dialects.
         """
+        
+        # Inject the connection dialect context directly into the prompt
+        enhanced_prompt = f"You are building an ETL pipeline extracting data from the {source} dialect and loading it into the {target} dialect. Ensure the syntax is compatible.\n\n{prompt}"
+        
         messages = [
             {
                 "role": "system", 
                 "content": "You are an expert AI agent generating ETL SQL. You have access to database tools via MCP."
             },
-            {"role": "user", "content": prompt}
+            {"role": "user", "content": enhanced_prompt}
         ]
         
         # Step 0: Ensure tools are discovered via MCP

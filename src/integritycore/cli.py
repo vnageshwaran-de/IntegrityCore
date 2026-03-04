@@ -35,29 +35,14 @@ def main():
 
 def run_ui():
     """
-    Wrapper command that executes `streamlit run` on the internal dashboard.py file.
+    Wrapper command that executes Uvicorn to host the DAG FastAPI backend.
     Command: `integrity-ui`
     """
-    # Resolve the path to dashboard.py within the package
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    dashboard_path = os.path.join(current_dir, "ui", "dashboard.py")
+    print("Launching IntegrityCore UI via Uvicorn...")
     
-    if not os.path.exists(dashboard_path):
-        print(f"Error: Could not find Streamlit dashboard at {dashboard_path}", file=sys.stderr)
-        sys.exit(1)
-        
-    print(f"Launching IntegrityCore UI from {dashboard_path}...")
-    
-    # We pass sys.argv[1:] to allow users to provide additional streamlit arguments
-    cmd = [sys.executable, "-m", "streamlit", "run", dashboard_path] + sys.argv[1:]
-    
-    try:
-        subprocess.run(cmd, check=True)
-    except KeyboardInterrupt:
-        print("\nUI Stopped.")
-    except Exception as e:
-        print(f"Failed to launch IntegrityCore UI: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Run uvicorn Programmatically
+    import uvicorn
+    uvicorn.run("integritycore.ui.api:app", host="0.0.0.0", port=8501, reload=True)
 
 if __name__ == "__main__":
     main()

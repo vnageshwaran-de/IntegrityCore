@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IntegrityCore Dashboard</title>
+
+    <!-- React & ReactDOM (Development for now) -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+    <!-- Babel for transpiling JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Tailwind for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        slate: {
+                            850: '#151e2e',
+                            900: '#0f172a',
+                        },
+                        brand: {
+                            500: '#3b82f6',
+                            600: '#2563eb',
+                        }
+                    },
+                    animation: {
+                        'pulse-glow': 'pulseGlow 2s cubic-bezier(0.4, 0, 0.6, 1) infinite',
+                        'typewriter': 'typewriter 2s steps(44) 1s 1 normal both',
+                        'blinkCaret': 'blinkCaret 500ms steps(44) infinite normal',
+                    },
+                    keyframes: {
+                        pulseGlow: {
+                            '0%, 100%': {
+                                opacity: 1,
+                                transform: 'scale(1)',
+                                boxShadow: '0 0 15px rgba(59, 130, 246, 0.5)'
+                            },
+                            '50%': {
+                                opacity: .8,
+                                transform: 'scale(1.02)',
+                                boxShadow: '0 0 25px rgba(59, 130, 246, 0.8)'
+                            },
+                        },
+                        typewriter: {
+                            from: { width: '0' },
+                            to: { width: '100%' }
+                        },
+                        blinkCaret: {
+                            from: { borderRightColor: 'rgba(255,255,255,0.75)' },
+                            to: { borderRightColor: 'transparent' }
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+
+    <style>
+        body {
+            background: radial-gradient(circle at top right, #1e293b, #0f172a);
+            font-family: 'Inter', -apple-system, sans-serif;
+            color: #f1f5f9;
+            min-height: 100vh;
+        }
+
+        .integritycore-header {
+            background: rgba(15, 23, 42, 0.7);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .glass-panel {
+            background: rgba(30, 41, 59, 0.6);
+            backdrop-filter: blur(16px);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+            box-shadow: 0 4px 30px rgba(0, 0, 0, 0.5);
+            border-radius: 12px;
+        }
+
+        .dag-node {
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            padding: 12px 18px;
+            background: rgba(15, 23, 42, 0.8);
+            min-width: 160px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            transition: all 0.3s ease;
+        }
+
+        .node-status-success {
+            border-left: 4px solid #10b981;
+            background: linear-gradient(90deg, rgba(16, 185, 129, 0.1) 0%, rgba(15, 23, 42, 0.8) 100%);
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.2);
+        }
+
+        .node-status-running {
+            border-left: 4px solid #3b82f6;
+            background: linear-gradient(90deg, rgba(59, 130, 246, 0.15) 0%, rgba(15, 23, 42, 0.8) 100%);
+        }
+
+        .node-status-failed {
+            border-left: 4px solid #ef4444;
+            background: linear-gradient(90deg, rgba(239, 68, 68, 0.1) 0%, rgba(15, 23, 42, 0.8) 100%);
+            box-shadow: 0 0 10px rgba(239, 68, 68, 0.3);
+        }
+
+        .node-status-pending {
+            border-left: 4px solid #475569;
+            opacity: 0.5;
+            filter: grayscale(100%);
+        }
+
+        .arrow {
+            width: 50px;
+            height: 2px;
+            background-color: rgba(255, 255, 255, 0.2);
+            position: relative;
+            margin: 0 12px;
+            transition: all 0.3s ease;
+        }
+
+        .arrow::after {
+            content: '';
+            position: absolute;
+            right: 0;
+            top: -5px;
+            border-top: 6px solid transparent;
+            border-bottom: 6px solid transparent;
+            border-left: 6px solid rgba(255, 255, 255, 0.2);
+            transition: all 0.3s ease;
+        }
+
+        .arrow-active {
+            background-color: #3b82f6;
+            box-shadow: 0 0 8px #3b82f6;
+        }
+
+        .arrow-active::after {
+            border-left-color: #3b82f6;
+        }
+
+        .arrow-failed {
+            background-color: #ef4444;
+        }
+
+        .arrow-failed::after {
+            border-left-color: #ef4444;
+        }
+
+        /* Hacker terminal styling */
+        .terminal-text {
+            border-right: .15em solid rgba(255, 255, 255, 0.75);
+            white-space: nowrap;
+            overflow: hidden;
+        }
+
+        /* Custom scrollbar for dark mode */
+        ::-webkit-scrollbar {
+            width: 8px;
+            height: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: rgba(15, 23, 42, 0.5);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: rgba(71, 85, 105, 0.8);
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(100, 116, 139, 1);
+        }
+    </style>
+</head>
+
+<body class="antialiased selection:bg-brand-500 selection:text-white">
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect } = React;
+
+        const App = () => {
+            const [status, setStatus] = useState("idle");
+            const [errorMsg, setErrorMsg] = useState("");
+            const [steps, setSteps] = useState({
+                generate: { status: "pending" },
+                verify: { status: "pending" },
+                repair: { status: "pending" }
+            });
+            const [finalSql, setFinalSql] = useState("");
+            const [prompt, setPrompt] = useState("Create an ETL pipeline that loads user active sessions into the analytics schema. Only load sessions that have been updated since the last pipeline run.");
+            const [sourceDb, setSourceDb] = useState("");
+            const [targetDb, setTargetDb] = useState("");
+
+            // Connection Manager State
+            const [activeTab, setActiveTab] = useState("dashboard");
+            const [connections, setConnections] = useState([]);
+            const [newConn, setNewConn] = useState({ name: "", dialect: "POSTGRESQL", host: "", username: "", password: "" });
+
+            // Fetch connections on load
+            useEffect(() => {
+                fetchConnections();
+            }, []);
+
+            const fetchConnections = async () => {
+                try {
+                    const res = await fetch("/api/connections");
+                    const data = await res.json();
+                    setConnections(data);
+                    if (data.length > 0 && !sourceDb) setSourceDb(data[0].name);
+                    if (data.length > 0 && !targetDb) setTargetDb(data[0].name);
+                } catch (err) {
+                    console.error("Failed to fetch connections", err);
+                }
+            };
+
+            const handleCreateConnection = async (e) => {
+                e.preventDefault();
+                try {
+                    await fetch("/api/connections", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(newConn)
+                    });
+                    setNewConn({ name: "", dialect: "POSTGRESQL", host: "", username: "", password: "" });
+                    fetchConnections();
+                } catch (err) {
+                    console.error("Error creating connection");
+                }
+            };
+
+            const pollStatus = async () => {
+                try {
+                    const res = await fetch("/api/status");
+                    const data = await res.json();
+                    setStatus(data.status);
+                    setSteps(data.steps);
+
+                    if (data.final_sql) setFinalSql(data.final_sql);
+                    if (data.error) setErrorMsg(data.error);
+
+                    if (data.status === "running") {
+                        setTimeout(pollStatus, 1500);
+                    }
+                } catch (e) {
+                    console.error("Failed to poll status", e);
+                }
+            };
+
+            const runDag = async () => {
+                setStatus("running");
+                setFinalSql("");
+                setErrorMsg("");
+                setSteps({
+                    generate: { status: "running" },
+                    verify: { status: "pending" },
+                    repair: { status: "pending" }
+                });
+
+                try {
+                    await fetch("/api/verify", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            prompt: prompt,
+                            strategy: "INCREMENTAL",
+                            model: "gemini/gemini-2.5-pro",
+                            source: sourceDb,
+                            target: targetDb
+                        })
+                    });
+                    setTimeout(pollStatus, 1000);
+                } catch (e) {
+                    alert("Failed to start DAG: " + e.message);
+                }
+            };
+
+            const getNodeClass = (statusStr) => {
+                if (statusStr === "success") return "node-status-success";
+                if (statusStr === "running") return "node-status-running animate-pulse-glow";
+                if (statusStr === "failed") return "node-status-failed";
+                return "node-status-pending";
+            };
+
+            // Logic to determine arrow highlight color based on previous node
+            const genToVerifyArrow = steps.generate.status === 'success' || steps.generate.status === 'running'
+                ? 'arrow-active' : '';
+            const verifyToRepairArrow = steps.verify.status === 'failed'
+                ? 'arrow-failed' : (steps.verify.status === 'success' ? 'arrow-active' : '');
+
+            return (
+                <div className="min-h-screen flex flex-col">
+                    <header className="integritycore-header p-4 flex justify-between items-center z-20">
+                        <div className="flex items-center space-x-3">
+                            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-indigo-600 flex items-center justify-center text-white font-bold shadow-lg">
+                                IC
+                            </div>
+                            <span className="text-xl font-bold tracking-tight text-white drop-shadow-sm">IntegrityCore</span>
+                            <span className="bg-slate-800 border border-slate-700 text-xs px-2 py-1 rounded text-slate-300 font-mono">v0.1.0</span>
+                        </div>
+                        <div className="flex space-x-2 bg-slate-800/80 p-1 rounded-lg border border-slate-700">
+                            <button
+                                onClick={() => setActiveTab("dashboard")}
+                                className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all ${activeTab === "dashboard" ? "bg-brand-500 text-white shadow-lg" : "text-slate-400 hover:text-white"}`}>
+                                Dashboard
+                            </button>
+                            <button
+                                onClick={() => setActiveTab("connections")}
+                                className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all ${activeTab === "connections" ? "bg-brand-500 text-white shadow-lg" : "text-slate-400 hover:text-white"}`}>
+                                Connections
+                            </button>
+                        </div>
+                        <div className="flex space-x-5 text-sm font-medium">
+                            <div className="flex items-center text-emerald-400 group"><span className="w-2.5 h-2.5 bg-emerald-500 rounded-full inline-block mr-2 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></span> Success</div>
+                            <div className="flex items-center text-rose-400"><span className="w-2.5 h-2.5 bg-rose-500 rounded-full inline-block mr-2 shadow-[0_0_8px_rgba(244,63,94,0.5)]"></span> Failed</div>
+                            <div className="flex items-center text-brand-400"><span className="w-2.5 h-2.5 bg-brand-500 rounded-full inline-block mr-2 shadow-[0_0_8px_rgba(59,130,246,0.8)] animate-pulse"></span> Running</div>
+                        </div>
+                    </header>
+
+                    {activeTab === "dashboard" && (
+                        <main className="flex-1 p-6 grid grid-cols-12 gap-8 relative z-10 w-full max-w-screen-2xl mx-auto">
+                            {/* Control Panel (Left) */}
+                            <div className="col-span-4 glass-panel p-6 flex flex-col h-full">
+                                <div className="flex items-center mb-6 border-b border-slate-700 pb-3">
+                                    <svg className="w-5 h-5 text-brand-400 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                                    <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide">Configuration</h2>
+                                </div>
+
+                                <div className="space-y-4 flex-1">
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Source (Extract)</label>
+                                            <select value={sourceDb} onChange={(e) => setSourceDb(e.target.value)} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                                                {connections.length === 0 && <option value="">No connections found</option>}
+                                                {connections.map(c => <option key={c.id} value={c.name}>{c.name} ({c.dialect})</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Target (Load)</label>
+                                            <select value={targetDb} onChange={(e) => setTargetDb(e.target.value)} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                                                {connections.length === 0 && <option value="">No connections found</option>}
+                                                {connections.map(c => <option key={c.id} value={c.name}>{c.name} ({c.dialect})</option>)}
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Engine (via ADK)</label>
+                                            <select className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                                                <option>gemini/gemini-2.5-pro</option>
+                                                <option>gpt-4-turbo</option>
+                                            </select>
+                                        </div>
+
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Verification</label>
+                                            <select className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                                                <option>INCREMENTAL</option>
+                                                <option>FULL_REFRESH</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <div className="flex-1 flex flex-col h-full mt-2">
+                                        <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">ETL Objective</label>
+                                        <textarea
+                                            className="w-full flex-1 min-h-[130px] border border-slate-600 rounded-lg p-3 bg-slate-800/50 text-slate-300 focus:outline-none focus:ring-1 focus:ring-brand-500 focus:border-transparent transition-all font-mono text-xs resize-none"
+                                            value={prompt}
+                                            onChange={(e) => setPrompt(e.target.value)}
+                                        />
+                                    </div>
+                                </div>
+
+                                <button
+                                    onClick={runDag}
+                                    disabled={status === "running"}
+                                    className={`w-full mt-6 text-white font-bold py-3.5 px-4 rounded-lg transition-all flex items-center justify-center
+                                    ${status === "running" ? 'bg-brand-800 cursor-not-allowed border border-brand-700' : 'bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 shadow-[0_0_15px_rgba(79,70,229,0.4)] border border-transparent group hover:-translate-y-0.5'}`}>
+
+                                    {status === "running" ? (
+                                        <><svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Executing DAG...</>
+                                    ) : (
+                                        <>Trigger DAG Pipeline <svg className="w-4 h-4 ml-2 group-hover:translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg></>
+                                    )}
+                                </button>
+                            </div>
+
+                            {/* Graph and Logs (Right) */}
+                            <div className="col-span-8 flex flex-col space-y-6">
+
+                                {/* Visual Graph View */}
+                                <div className="glass-panel p-6 flex-1 flex flex-col relative overflow-hidden group">
+                                    <h3 className="text-sm font-semibold text-slate-400 absolute top-4 left-6 z-20 uppercase tracking-wider flex items-center">
+                                        <svg className="w-4 h-4 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4"></path></svg>
+                                        Execution Graph
+                                    </h3>
+
+                                    {/* Background Dot Grid */}
+                                    <div className="absolute inset-0 pointer-events-none opacity-[0.03] transition-opacity group-hover:opacity-[0.06]" style={{ backgroundImage: 'radial-gradient(circle at 10px 10px, white 1.5px, transparent 0)', backgroundSize: '30px 30px' }}></div>
+
+                                    <div className="flex-1 flex items-center justify-center relative z-10 w-full overflow-x-auto min-h-[250px]">
+                                        <div className="flex items-center min-w-max p-10">
+
+                                            {/* Generate Node */}
+                                            <div className={`dag-node ${getNodeClass(steps.generate.status)} ${steps.generate.status !== 'pending' ? 'opacity-100 scale-100' : 'opacity-0 scale-95 transform'}`}>
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Stage 1</div>
+                                                    <div className="font-semibold text-slate-100">Generate Logic</div>
+                                                </div>
+                                                <div className="ml-4 text-[10px] bg-slate-800/80 border border-slate-600 px-2 py-1 rounded text-slate-300 font-mono">ADK</div>
+                                            </div>
+
+                                            <div className={`arrow ${genToVerifyArrow}`} style={{ opacity: steps.verify.status !== 'pending' || steps.generate.status === 'success' ? 1 : 0 }}></div>
+
+                                            {/* Verify Node */}
+                                            <div className={`dag-node relative ${getNodeClass(steps.verify.status)} ${steps.verify.status !== 'pending' ? 'transition-all duration-500 opacity-100 scale-100' : 'opacity-0 scale-95 transform'}`}>
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Stage 2</div>
+                                                    <div className="font-semibold text-slate-100">SMT Proof Validation</div>
+                                                </div>
+                                                <div className="ml-4 text-[10px] bg-indigo-900/50 border border-indigo-700/50 text-indigo-200 px-2 py-1 rounded font-mono font-bold">Z3</div>
+
+                                                {/* Error Tooltip on Hover */}
+                                                {steps.verify.status === 'failed' && (
+                                                    <div className="absolute -bottom-12 left-1/2 -translate-x-1/2 bg-rose-900/90 border border-rose-700 text-rose-100 text-[10px] p-2 rounded whitespace-nowrap shadow-xl z-50 animate-bounce">
+                                                        Bounds Rejected ❌
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            <div className={`arrow border-dashed border-t-2 border-slate-600 bg-transparent flex items-center justify-center relative transition-colors duration-500`}
+                                                style={{ opacity: steps.verify.status === 'failed' || steps.repair.status !== 'pending' ? 1 : 0 }}>
+                                                {steps.verify.status === 'failed' && <span className="absolute -top-7 text-[10px] text-rose-500 font-bold bg-slate-900 px-2 py-0.5 rounded border border-slate-700">Fallback</span>}
+                                            </div>
+
+                                            {/* Repair Node */}
+                                            <div className={`dag-node ${getNodeClass(steps.repair.status)} ${steps.repair.status !== 'pending' ? 'transition-all duration-500 opacity-100 scale-100' : 'opacity-0 scale-95 transform hidden'}`}>
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Stage 3</div>
+                                                    <div className="font-semibold text-slate-100">Autonomic Repair</div>
+                                                </div>
+                                                <div className="ml-4 text-[10px] bg-orange-900/40 border border-orange-700/50 px-2 py-1 rounded text-orange-200 font-mono">ADK</div>
+                                            </div>
+
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Hacker Terminal Logs */}
+                                <div className="glass-panel text-[#d4d4d4] p-5 h-72 border border-slate-700 relative overflow-hidden flex flex-col group">
+                                    <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-transparent via-brand-500 to-transparent opacity-20 group-hover:opacity-40 transition-opacity"></div>
+
+                                    <div className="text-[10px] border-b border-slate-700/80 pb-3 mb-3 flex justify-between tracking-widest text-slate-500 font-bold uppercase transition-colors group-hover:text-slate-400">
+                                        <span className="flex items-center"><svg className="w-3 h-3 mr-1.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 9l3 3-3 3m5 0h3M5 20h14a2 2 0 002-2V6a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg> Integrity_Core.Daemon</span>
+                                        <span className={status === "running" ? "text-brand-400 animate-pulse" : (status === "failed" ? "text-rose-400" : (status === "success" ? "text-emerald-400" : ""))}>
+                                            {status.toUpperCase()}
+                                        </span>
+                                    </div>
+
+                                    <div className="font-mono text-xs overflow-y-auto flex-1 pr-2 leading-relaxed space-y-1.5">
+                                        {status === "idle" && <div className="text-slate-600 italic">user@ic-daemon:~# waiting for DAG trigger trigger...</div>}
+
+                                        {status === "running" && (
+                                            <>
+                                                <div className="text-emerald-400/80 animate-typewriter terminal-text w-full">[+] System: Polling agent state via Model Context Protocol...</div>
+                                                <div className="text-emerald-400/80 animate-typewriter terminal-text w-full" style={{ animationDelay: "1.5s" }}>[+] MCP: Synchronizing Postgres / Snowflake Adapters...</div>
+                                            </>
+                                        )}
+
+                                        {errorMsg && (
+                                            <div className="mt-4 break-words">
+                                                <div className="text-rose-500 font-bold bg-rose-950/30 p-2 rounded border-l-4 border-rose-600 mb-2 uppercase text-[10px] tracking-widest">Fatal API Error Encountered</div>
+                                                <div className="text-rose-300 p-3 bg-black/40 rounded border border-rose-900/50 shadow-inner whitespace-pre-wrap font-mono relative">
+                                                    <div className="absolute left-0 top-0 bottom-0 w-8 bg-black/40 border-r border-rose-900/50 flex flex-col items-center pt-2 text-rose-800 text-[9px] select-none">
+                                                        1
+                                                        <br />2
+                                                        <br />3
+                                                    </div>
+                                                    <span className="pl-6 block">{errorMsg}</span>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {finalSql && (
+                                            <div className="mt-4 animate-typewriter w-full" style={{ animationFillMode: 'forwards' }}>
+                                                <div className="text-emerald-400 font-bold bg-emerald-950/30 p-2 rounded border-l-4 border-emerald-500 mb-2 uppercase text-[10px] tracking-widest flex items-center">
+                                                    <svg className="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                                    Glass Box SMT Proof Verified
+                                                </div>
+                                                <div className="bg-[#1e1e1e] p-4 rounded-lg border border-slate-700 shadow-inner overflow-x-auto relative mt-1">
+                                                    <div className="absolute top-2 right-2 text-[9px] text-slate-500 font-bold uppercase">Bounded SQL</div>
+                                                    <pre className="text-amber-300 whitespace-pre-wrap font-mono mt-1 text-[11px] leading-relaxed"><code>{finalSql}</code></pre>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Blinking cursor */}
+                                        <div className="inline-block w-2.5 h-[1.15em] bg-slate-500 align-text-bottom mt-1 ml-1 animate-[blink_1s_infinite] opacity-50"></div>
+                                    </div>
+                                </div>
+                            </div>
+                        </main>
+                    )}
+
+                    {/* Connections View */}
+                    {activeTab === "connections" && (
+                        <div className="max-w-7xl mx-auto flex-1 p-6 grid grid-cols-1 md:grid-cols-3 gap-6 w-full pt-10">
+
+                            {/* Connection Form */}
+                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-2xl col-span-1 h-fit">
+                                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-teal-500 to-emerald-500"></div>
+                                <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide mb-6">New Database</h2>
+
+                                <form onSubmit={handleCreateConnection} className="space-y-4 flex-1">
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">Connection Name</label>
+                                        <input required type="text" value={newConn.name} onChange={e => setNewConn({ ...newConn, name: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="e.g. Prod Snowflake" />
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">Dialect</label>
+                                        <select value={newConn.dialect} onChange={e => setNewConn({ ...newConn, dialect: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm">
+                                            <option value="POSTGRESQL">PostgreSQL</option>
+                                            <option value="SNOWFLAKE">Snowflake</option>
+                                            <option value="BIGQUERY">BigQuery</option>
+                                            <option value="MYSQL">MySQL</option>
+                                        </select>
+                                    </div>
+                                    <div>
+                                        <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">Host / URI</label>
+                                        <input required type="text" value={newConn.host} onChange={e => setNewConn({ ...newConn, host: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="postgres://..." />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Username</label>
+                                            <input type="text" value={newConn.username} onChange={e => setNewConn({ ...newConn, username: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                        </div>
+                                        <div>
+                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Password</label>
+                                            <input type="password" value={newConn.password} onChange={e => setNewConn({ ...newConn, password: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                        </div>
+                                    </div>
+                                    <button type="submit" className="w-full bg-teal-600 hover:bg-teal-500 text-white font-bold py-3 px-4 rounded transition-all mt-4 font-mono text-sm shadow-[0_0_15px_rgba(20,184,166,0.5)]">
+                                        SAVE CONNECTION
+                                    </button>
+                                </form>
+                            </div>
+
+                            {/* Configured Connections Table */}
+                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-2xl col-span-2">
+                                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-slate-600 to-slate-500"></div>
+                                <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide mb-6">Configured Adapters</h2>
+
+                                <div className="overflow-y-auto flex-1 h-full">
+                                    <table className="w-full text-left border-collapse">
+                                        <thead>
+                                            <tr className="border-b border-slate-700 text-xs font-bold text-slate-400 uppercase tracking-wider">
+                                                <th className="pb-3 text-left">Name</th>
+                                                <th className="pb-3 text-left">Dialect</th>
+                                                <th className="pb-3 text-left w-64 max-w-sm">Host</th>
+                                                <th className="pb-3 text-right">Status</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="text-sm">
+                                            {connections.length === 0 && (
+                                                <tr><td colSpan="4" className="py-8 text-center text-slate-500 italic">No connections configured yet.</td></tr>
+                                            )}
+                                            {connections.map(c => (
+                                                <tr key={c.id} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                                                    <td className="py-4 font-semibold text-slate-200">{c.name}</td>
+                                                    <td className="py-4 text-brand-400 font-mono text-[10px] font-bold">{c.dialect}</td>
+                                                    <td className="py-4 text-slate-400 truncate w-64 max-w-sm font-mono text-xs">{c.host}</td>
+                                                    <td className="py-4 text-right">
+                                                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-emerald-900/40 text-emerald-400 border border-emerald-800/50 uppercase">
+                                                            Connected
+                                                        </span>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>

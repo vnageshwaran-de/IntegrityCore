@@ -1,0 +1,55 @@
+Metadata-Version: 2.4
+Name: integritycore
+Version: 0.1.0
+Summary: A cloud-agnostic, pip-installable agentic framework for mathematical ETL verification.
+License: MIT License
+        
+        Copyright (c) 2026 IntegrityCore Contributors
+        
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+        
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: z3-solver
+Requires-Dist: google-adk
+Requires-Dist: litellm
+Requires-Dist: fastapi
+Requires-Dist: uvicorn
+Requires-Dist: fastmcp
+Requires-Dist: google-cloud-secret-manager
+Dynamic: license-file
+
+# IntegrityCore
+
+A cloud-agnostic, pip-installable agentic framework for mathematical ETL verification.
+
+## Architecture
+
+To support both a CLI (for backend tasks) and the Streamlit UI, we rely on the following structure:
+- `core/`: Z3 SMT & AST Logic
+- `adapters/`: Cloud Adapters (GCP, etc.)
+- `agents/`: ADK Agent Definitions
+- `ui/`: Streamlit App Code
+- `cli.py`: Command-Line Entry Point
+
+## Features
+- **Core Verification Logic**: Relies on Z3 and AST to guarantee the correctness of model-agnostic LLM inputs.
+- **Multi-Agent Orchestration**: Generate -> Verify -> Repair cycle, using MCP for connecting tools.
+- **Glass Box Verification**: Streamlit UI that allows users to examine internal proofs dynamically.
