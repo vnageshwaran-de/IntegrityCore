@@ -484,6 +484,12 @@
                     setDryStatus(r);
                     setIteration(i => i + 1);
 
+                    // When dry-run used a merged prompt (e.g. after user clarification), update form.prompt
+                    // so that Save stores the full prompt and the job runs with it
+                    if (r.effective_prompt && r.effective_prompt.trim()) {
+                        setForm(f => ({ ...f, prompt: r.effective_prompt }));
+                    }
+
                     // Add to chat history
                     setChatHistory(h => [...h, {
                         type: 'result',

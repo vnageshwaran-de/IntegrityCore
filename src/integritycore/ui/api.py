@@ -33,12 +33,20 @@ conn_manager = ConnectionManager()
 
 # ── Pydantic schemas ──────────────────────────────────────────────────────────
 
+def _merge_prompt_and_feedback(prompt: str, user_feedback: Optional[str]) -> str:
+    """Combine prompt and user clarification so saved jobs run with full context."""
+    if not user_feedback or not user_feedback.strip():
+        return prompt.strip()
+    return f"{prompt.strip()}\n\nUser clarification: {user_feedback.strip()}"
+
+
 class JobCreate(BaseModel):
     name: str
     description: Optional[str] = ""
     source_conn_id: str
     target_conn_id: str
     prompt: str
+    user_feedback: Optional[str] = None  # If provided, stored prompt = prompt + clarification (so job runs with full context)
     schedule_cron: Optional[str] = ""
     schedule_label: Optional[str] = ""
     status: Optional[str] = JobStatus.ACTIVE
@@ -49,6 +57,7 @@ class JobUpdate(BaseModel):
     source_conn_id: Optional[str] = None
     target_conn_id: Optional[str] = None
     prompt: Optional[str] = None
+    user_feedback: Optional[str] = None  # If provided with prompt, stored prompt = prompt + clarification
     schedule_cron: Optional[str] = None
     schedule_label: Optional[str] = None
     status: Optional[str] = None
@@ -87,8 +96,9 @@ async def list_jobs():
 
 @app.post("/api/jobs", status_code=201)
 async def create_job(payload: JobCreate):
-    """Create a new ETL job and optionally schedule it."""
+    """Create a new ETL job and optionally schedule it. If user_feedback is provided, the stored prompt is prompt + clarification so runs use full context."""
     import uuid
+    stored_prompt = _merge_prompt_and_feedback(payload.prompt, payload.user_feedback)
     with get_db() as db:
         job = Job(
             id=str(uuid.uuid4()),
@@ -96,7 +106,7 @@ async def create_job(payload: JobCreate):
             description=payload.description or "",
             source_conn_id=payload.source_conn_id,
             target_conn_id=payload.target_conn_id,
-            prompt=payload.prompt,
+            prompt=stored_prompt,
             schedule_cron=payload.schedule_cron or "",
             schedule_label=payload.schedule_label or "",
             status=payload.status or JobStatus.ACTIVE,
@@ -132,7 +142,13 @@ async def update_job(job_id: str, payload: JobUpdate):
         job = db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise HTTPException(404, "Job not found")
-        for field, val in payload.dict(exclude_none=True).items():
+        updates = payload.dict(exclude_none=True)
+        # Merge prompt + user_feedback so stored prompt has full context for future runs
+        if "user_feedback" in updates:
+            user_feedback = updates.pop("user_feedback")
+            base_prompt = updates.get("prompt") or job.prompt
+            updates["prompt"] = _merge_prompt_and_feedback(base_prompt, user_feedback)
+        for field, val in updates.items():
             setattr(job, field, val)
         job.updated_at = datetime.datetime.utcnow()
         cron = job.schedule_cron
@@ -186,12 +202,36 @@ async def resume_job(job_id: str):
 
 # ── Interactive Dry Run ───────────────────────────────────────────────────────
 
+class ValidatePromptRequest(BaseModel):
+    """Request for interactive prompt-only validation (no SQL generation)."""
+    source_dialect: str = "POSTGRES"
+    target_dialect: str = "SNOWFLAKE"
+    prompt: str
+
 class DryRunRequest(BaseModel):
     source_conn_id: str
     target_conn_id: str
     prompt: str
     user_feedback: Optional[str] = None     # feedback from previous attempt
     previous_sql: Optional[str] = None      # SQL from previous attempt to improve
+
+@app.post("/api/jobs/validate-prompt")
+async def validate_prompt(req: ValidatePromptRequest):
+    """Validate an ETL prompt only (no SQL generation). Returns structured blockers, warnings, suggestions, and extracted hints for interactive UI."""
+    from integritycore.core.prompt_validation import validate_etl_prompt
+
+    def _run():
+        result = validate_etl_prompt(
+            prompt=req.prompt,
+            source_dialect=req.source_dialect,
+            target_dialect=req.target_dialect,
+        )
+        return result.to_dict()
+
+    loop = asyncio.get_event_loop()
+    with concurrent.futures.ThreadPoolExecutor() as pool:
+        return await loop.run_in_executor(pool, _run)
+
 
 @app.post("/api/jobs/dry-run")
 async def dry_run(req: DryRunRequest):
@@ -228,10 +268,16 @@ async def dry_run(req: DryRunRequest):
         _log(f"Source: {src.name} ({src.dialect}) | Target: {tgt.name} ({tgt.dialect})")
         _log("⏳ Starting LangGraph ETL Agent...")
 
+        # Merge user feedback into the prompt so validation and generation both see it (preserves conversation memory)
+        effective_prompt = req.prompt
+        if req.user_feedback and req.user_feedback.strip():
+            effective_prompt = f"{req.prompt.strip()}\n\nUser clarification: {req.user_feedback.strip()}"
+            _log("📎 User clarification included in prompt for this run.")
+
         state_input = {
             "source_dialect": src.dialect,
             "target_dialect": tgt.dialect,
-            "prompt": req.prompt,
+            "prompt": effective_prompt,
             "strategy": strategy,
             "model_name": model,
             "messages": [],
@@ -240,6 +286,7 @@ async def dry_run(req: DryRunRequest):
             "verification_details": "",
             "is_valid_prompt": True,
             "validation_error": "",
+            "validation_result": None,
             "special_action": "",
             "repair_attempts": 0,
             "max_repairs": 3,
@@ -251,6 +298,7 @@ async def dry_run(req: DryRunRequest):
         }
         
         if req.user_feedback and req.previous_sql:
+            # Follow-up after SQL was generated (e.g. repair or refinement)
             state_input["messages"] = [
                 {"role": "system", "content": "You are an expert ETL SQL generator. Return ONLY valid SQL wrapped in a ```sql code block."},
                 {"role": "user", "content": (
@@ -276,7 +324,9 @@ async def dry_run(req: DryRunRequest):
                 "verification_details": "",
                 "repair_attempts": 0,
                 "logs": log_lines,
-                "error": final_state.get("validation_error", "Vague prompt. Please clarify.")
+                "error": final_state.get("validation_error", "Vague prompt. Please clarify."),
+                "validation_result": final_state.get("validation_result"),
+                "effective_prompt": effective_prompt,
             }
         
         status = "verified" if final_state["verified"] else ("repaired" if final_state["repair_attempts"] > 0 else "unverified")
@@ -293,10 +343,12 @@ async def dry_run(req: DryRunRequest):
                 "repair_attempts": final_state["repair_attempts"],
                 "logs": log_lines,
                 "error": "The target table does not exist. Do you want the LLM to write the CREATE TABLE statement for you based on the source data?",
+                "validation_result": final_state.get("validation_result"),
+                "effective_prompt": effective_prompt,
             }
             
         _log(f"{'✅' if final_state['verified'] else '⚠️'} Dry run complete — status: {status}")
-        
+
         return {
             "status": status,
             "phase": "complete",
@@ -306,17 +358,8 @@ async def dry_run(req: DryRunRequest):
             "repair_attempts": final_state.get("repair_attempts", 0),
             "logs": log_lines,
             "error": "" if final_state.get("verified") else final_state.get("verification_details", ""),
-        }
-
-        return {
-            "status": status,
-            "phase": "complete",
-            "sql": sql,
-            "verified": verified,
-            "verification_details": verification_details,
-            "repair_attempts": repair_attempts,
-            "logs": log_lines,
-            "error": "" if verified else verification_details,
+            "validation_result": final_state.get("validation_result"),
+            "effective_prompt": effective_prompt,
         }
 
     loop = asyncio.get_event_loop()
