@@ -5,6 +5,7 @@ from langgraph.graph import StateGraph, START, END
 import litellm
 
 from integritycore.core.verifier import LogicVerifier, ETLStrategy
+from integritycore.core.prompt_validation import validate_etl_prompt, PromptValidationResult
 from integritycore.adapters.executor import ExecutionResult
 
 # ── State Definition ──────────────────────────────────────────────────────────
@@ -26,6 +27,7 @@ class ETLState(TypedDict):
     # Verification and control flow
     is_valid_prompt: bool
     validation_error: str
+    validation_result: Optional[Dict[str, Any]]  # Structured: blockers, warnings, suggestions, extracted_hints
     verified: bool
     verification_details: str
     special_action: str
@@ -44,51 +46,45 @@ class ETLState(TypedDict):
 # ── Nodes ─────────────────────────────────────────────────────────────────────
 
 def validate_prompt_node(state: ETLState) -> Dict:
-    """Pre-flight check: validates if the user prompt has enough context."""
+    """Structured pre-flight validation: completeness, unambiguity, dialect consistency, and feasibility."""
     prompt = state.get("prompt", "")
     src = state.get("source_dialect", "Unknown")
     tgt = state.get("target_dialect", "Unknown")
     model_name = state.get("model_name", "gemini/gemini-2.5-flash")
-    
-    messages = [
-        {"role": "system", "content": (
-            "You are a strict data engineering requirements validator. "
-            "The user will provide an ETL instruction to move data from a "
-            f"Source ({src}) to a Target ({tgt}).\n\n"
-            "Evaluate if the prompt is logically complete. If it asks to load a vague entity "
-            "(e.g. 'pull the india table') without context of what schema/system that belongs to, reject it.\n"
-            "Rules:\n"
-            "- If valid, return EXACTLY 'YES'\n"
-            "- If invalid/vague, return 'NO: <explain clearly what information is missing>'\n"
-            "Keep the rejection explanation under 2 sentences."
-        )},
-        {"role": "user", "content": prompt}
-    ]
-    
-    try:
-        resp = litellm.completion(model=model_name, messages=messages)
-        content = resp.choices[0].message.content.strip()
-        
-        if content.upper().startswith("YES"):
-            return {
-                "is_valid_prompt": True,
-                "validation_error": "",
-                "logs": ["✅ Pre-flight validation passed."]
-            }
+
+    result: PromptValidationResult = validate_etl_prompt(
+        prompt=prompt,
+        source_dialect=src,
+        target_dialect=tgt,
+        model_name=model_name,
+    )
+    validation_dict = result.to_dict()
+
+    log_lines = []
+    if result.is_valid:
+        if result.warnings:
+            log_lines.append("✅ Pre-flight validation passed with warnings.")
+            for w in result.warnings:
+                log_lines.append(f"  ⚠️ {w.code}: {w.message}")
         else:
-            err = content[content.find(":")+1:].strip() if ":" in content else content
-            return {
-                "is_valid_prompt": False,
-                "validation_error": err,
-                "logs": [f"🚫 Pre-flight validation failed: {err}"]
-            }
-    except Exception as e:
-        # Fallback to true if LLM validation crashes, so we don't completely block execution
-        return {
-            "is_valid_prompt": True, 
-            "validation_error": "", 
-            "logs": [f"⚠️ Prompt validation omitted due to API error: {e}"]
-        }
+            log_lines.append("✅ Pre-flight validation passed.")
+        if result.extracted_hints:
+            hints = result.extracted_hints.to_dict()
+            if hints:
+                log_lines.append(f"  Inferred: {hints}")
+    else:
+        log_lines.append("🚫 Pre-flight validation failed (blockers must be resolved).")
+        for b in result.blockers:
+            log_lines.append(f"  ❌ {b.code}: {b.message}")
+            if b.suggestion_question:
+                log_lines.append(f"     → {b.suggestion_question}")
+
+    return {
+        "is_valid_prompt": result.is_valid,
+        "validation_error": result.summary_message(),
+        "validation_result": validation_dict,
+        "logs": log_lines,
+    }
 
 
 def generate_sql_node(state: ETLState) -> Dict:
