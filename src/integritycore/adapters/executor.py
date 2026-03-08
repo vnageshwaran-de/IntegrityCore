@@ -38,20 +38,24 @@ class DatabaseExecutor:
     def execute(self, sql: str, conn: DBConnection) -> ExecutionResult:
         """Connect, run SQL, return ExecutionResult with full telemetry."""
         dialect = (conn.dialect or "").upper()
-
         if dialect == "SNOWFLAKE":
-            return self._execute_snowflake(sql, conn)
+            return self._execute_snowflake(sql, conn, is_compile_only=False)
         else:
-            return ExecutionResult(
-                success=False,
-                error=f"Dialect '{dialect}' not yet supported for live execution. Only SNOWFLAKE is supported."
-            )
+            return ExecutionResult(success=False, error=f"Dialect '{dialect}' not yet supported for live execution.")
+
+    def compile_only(self, sql: str, conn: DBConnection) -> ExecutionResult:
+        """Connect and run an EXPLAIN or dry-run compilation check without executing the query permanently."""
+        dialect = (conn.dialect or "").upper()
+        if dialect == "SNOWFLAKE":
+            return self._execute_snowflake(sql, conn, is_compile_only=True)
+        else:
+            return ExecutionResult(success=False, error=f"Dialect '{dialect}' not yet supported for compile checks.")
 
     # ------------------------------------------------------------------
     # Snowflake implementation
     # ------------------------------------------------------------------
 
-    def _execute_snowflake(self, sql: str, conn: DBConnection) -> ExecutionResult:
+    def _execute_snowflake(self, sql: str, conn: DBConnection, is_compile_only: bool = False) -> ExecutionResult:
         try:
             import snowflake.connector
         except ImportError:
@@ -86,26 +90,50 @@ class DatabaseExecutor:
             # ── Schema introspection (best-effort) ────────────────────
             schema_info = self._introspect_schema(cursor, sql)
 
-            # ── Execute the SQL ───────────────────────────────────────
-            self.log(f"[Executor] ── Executing SQL ─────────────────────────────")
-            self.log(f"[Executor]   Statement length: {len(sql)} chars")
-
+            # ── Compile or Execute the SQL ────────────────────────────
             t0 = time.time()
-            cursor.execute(sql)
-            duration_ms = (time.time() - t0) * 1000
-
-            query_id = cursor.sfqid
-            rows_affected = cursor.rowcount or 0
-
-            # Fetch a small sample for logging (SELECT statements)
-            sample = []
+            
             try:
-                sample = cursor.fetchmany(5)
-            except Exception:
-                pass
+                if is_compile_only:
+                    self.log(f"[Executor] ── Compiling SQL (Dry Run) ───────────────")
+                    # Snowflake 'EXPLAIN' only supports single statements.
+                    if ";" in sql.strip(" \n\t;"):
+                        self.log("[Executor]   Skipping strict EXPLAIN since query contains multiple statements.")
+                        return ExecutionResult(success=True, duration_ms=0, schema=schema_info)
+                    cursor.execute(f"EXPLAIN USING JSON {sql}")
+                    query_id = cursor.sfqid
+                    rows_affected = 0
+                    sample = []
+                else:
+                    self.log(f"[Executor] ── Executing SQL ─────────────────────────────")
+                    self.log(f"[Executor]   Statement length: {len(sql)} chars")
+                    
+                    cursors = list(sf_conn.execute_string(sql))
+                    query_id = cursors[0].sfqid if cursors else None
+                    rows_affected = sum(c.rowcount or 0 for c in cursors)
+                    
+                    # Fetch a small sample from the last cursor if applicable
+                    sample = []
+                    last_cursor = cursors[-1] if cursors else None
+                    if last_cursor and last_cursor.description:
+                        try:
+                            sample = last_cursor.fetchmany(5)
+                        except Exception:
+                            pass
+            except Exception as e:
+                err = str(e)
+                self.log(f"[Executor] ❌ Execution error: {err}")
+                return ExecutionResult(success=False, error=err)
+
+            duration_ms = (time.time() - t0) * 1000
+            
+            if is_compile_only:
+                self.log(f"[Executor] ✅ Compilation successful")
+                return ExecutionResult(success=True, duration_ms=duration_ms, schema=schema_info)
 
             self.log(f"[Executor] ✅ Query complete")
-            self.log(f"[Executor]   Query ID      : {query_id}")
+            if query_id:
+                self.log(f"[Executor]   Query ID      : {query_id}")
             self.log(f"[Executor]   Rows affected : {rows_affected:,}")
             self.log(f"[Executor]   Duration      : {duration_ms:.1f} ms")
 
@@ -122,11 +150,6 @@ class DatabaseExecutor:
                 sample_rows=list(sample),
                 query_id=query_id,
             )
-
-        except Exception as e:
-            err = str(e)
-            self.log(f"[Executor] ❌ Execution error: {err}")
-            return ExecutionResult(success=False, error=err)
 
         finally:
             try:
