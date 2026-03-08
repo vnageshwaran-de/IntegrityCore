@@ -1,8 +1,42 @@
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+/dist/
+/build/
+
+# ── Virtual environments ────────────────────────────────────────────────────
 venv/
 .venv/
-__pycache__/
-*.pyc
+env/
+.env/
+
+# ── Credentials & secrets ───────────────────────────────────────────────────
 .env
-.pytest_cache/
-connections.json
+*.env
+.env.*
+secrets.json
+credentials.json
+connections.json           # stored in ~/.integritycore/ not the repo
+
+# ── Logs & runtime artefacts ─────────────────────────────────────────────────
+run.log
+*.log
+nohup.out
+
+# ── OS / IDE ────────────────────────────────────────────────────────────────
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Testing ──────────────────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
