@@ -37,6 +37,10 @@ def main():
         "is_valid_prompt": True,
         "validation_error": "",
         "validation_result": None,
+        "metadata_manager": None,
+        "grounding_result": None,
+        "grounded_ddl": "",
+        "semantic_mappings": None,
         "special_action": "",
         "repair_attempts": 0,
         "max_repairs": 3,
@@ -44,7 +48,7 @@ def main():
         "source_conn": None,
         "target_conn": None,
         "executor": None,
-        "logs": []
+        "logs": [],
     }
     
     try:

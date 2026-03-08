@@ -16,7 +16,10 @@ dependencies = [
     "fastapi",
     "uvicorn",
     "fastmcp",
-    "google-cloud-secret-manager"
+    "google-cloud-secret-manager",
+    "duckdb",
+    "lancedb",
+    "pyarrow",
 ]
 
 [project.scripts]
