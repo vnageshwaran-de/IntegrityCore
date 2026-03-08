@@ -238,6 +238,8 @@ async def dry_run(req: DryRunRequest):
             "sql": "",
             "verified": False,
             "verification_details": "",
+            "is_valid_prompt": True,
+            "validation_error": "",
             "special_action": "",
             "repair_attempts": 0,
             "max_repairs": 3,
@@ -263,6 +265,19 @@ async def dry_run(req: DryRunRequest):
         final_state = graph.invoke(state_input)
         
         log_lines.extend(final_state.get("logs", []))
+        
+        if final_state.get("is_valid_prompt", True) is False:
+            _log(f"🚫 Prompt validation failed: {final_state.get('validation_error')}")
+            return {
+                "status": "validation_failed",
+                "phase": "intercept",
+                "sql": None,
+                "verified": False,
+                "verification_details": "",
+                "repair_attempts": 0,
+                "logs": log_lines,
+                "error": final_state.get("validation_error", "Vague prompt. Please clarify.")
+            }
         
         status = "verified" if final_state["verified"] else ("repaired" if final_state["repair_attempts"] > 0 else "unverified")
         

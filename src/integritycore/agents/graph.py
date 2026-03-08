@@ -24,6 +24,8 @@ class ETLState(TypedDict):
     sql: str
     
     # Verification and control flow
+    is_valid_prompt: bool
+    validation_error: str
     verified: bool
     verification_details: str
     special_action: str
@@ -40,6 +42,54 @@ class ETLState(TypedDict):
 
 
 # ── Nodes ─────────────────────────────────────────────────────────────────────
+
+def validate_prompt_node(state: ETLState) -> Dict:
+    """Pre-flight check: validates if the user prompt has enough context."""
+    prompt = state.get("prompt", "")
+    src = state.get("source_dialect", "Unknown")
+    tgt = state.get("target_dialect", "Unknown")
+    model_name = state.get("model_name", "gemini/gemini-2.5-flash")
+    
+    messages = [
+        {"role": "system", "content": (
+            "You are a strict data engineering requirements validator. "
+            "The user will provide an ETL instruction to move data from a "
+            f"Source ({src}) to a Target ({tgt}).\n\n"
+            "Evaluate if the prompt is logically complete. If it asks to load a vague entity "
+            "(e.g. 'pull the india table') without context of what schema/system that belongs to, reject it.\n"
+            "Rules:\n"
+            "- If valid, return EXACTLY 'YES'\n"
+            "- If invalid/vague, return 'NO: <explain clearly what information is missing>'\n"
+            "Keep the rejection explanation under 2 sentences."
+        )},
+        {"role": "user", "content": prompt}
+    ]
+    
+    try:
+        resp = litellm.completion(model=model_name, messages=messages)
+        content = resp.choices[0].message.content.strip()
+        
+        if content.upper().startswith("YES"):
+            return {
+                "is_valid_prompt": True,
+                "validation_error": "",
+                "logs": ["✅ Pre-flight validation passed."]
+            }
+        else:
+            err = content[content.find(":")+1:].strip() if ":" in content else content
+            return {
+                "is_valid_prompt": False,
+                "validation_error": err,
+                "logs": [f"🚫 Pre-flight validation failed: {err}"]
+            }
+    except Exception as e:
+        # Fallback to true if LLM validation crashes, so we don't completely block execution
+        return {
+            "is_valid_prompt": True, 
+            "validation_error": "", 
+            "logs": [f"⚠️ Prompt validation omitted due to API error: {e}"]
+        }
+
 
 def generate_sql_node(state: ETLState) -> Dict:
     """Invokes the LLM to generate or repair the ETL logic."""
@@ -203,6 +253,12 @@ def execution_repair_node(state: ETLState) -> Dict:
 
 # ── Edge Routers ──────────────────────────────────────────────────────────────
 
+def route_after_validation(state: ETLState) -> Literal["generate_sql_node", "__end__"]:
+    """Routes to Generation if valid, otherwise ends the graph."""
+    if state.get("is_valid_prompt", True) is False:
+        return "__end__"
+    return "generate_sql_node"
+
 def route_after_verification(state: ETLState) -> Literal["execute_node", "prepare_repair_node", "__end__"]:
     if state.get("verified"):
         return "__end__" if state.get("is_dry_run") else "execute_node"
@@ -233,6 +289,7 @@ def build_etl_graph() -> Any:
     workflow = StateGraph(ETLState)
     
     # Add nodes
+    workflow.add_node("validate_prompt_node", validate_prompt_node)
     workflow.add_node("generate_sql_node", generate_sql_node)
     workflow.add_node("verify_node", verify_node)
     workflow.add_node("prepare_repair_node", prepare_repair_node)
@@ -240,7 +297,17 @@ def build_etl_graph() -> Any:
     workflow.add_node("execution_repair_node", execution_repair_node)
     
     # Add edges
-    workflow.add_edge(START, "generate_sql_node")
+    workflow.add_edge(START, "validate_prompt_node")
+    
+    workflow.add_conditional_edges(
+        "validate_prompt_node",
+        route_after_validation,
+        {
+            "generate_sql_node": "generate_sql_node",
+            "__end__": END
+        }
+    )
+    
     workflow.add_edge("generate_sql_node", "verify_node")
     
     workflow.add_conditional_edges(

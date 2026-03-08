@@ -449,8 +449,7 @@
                 if (v === '__custom__') { setCustomCron(true); return; }
                 setCustomCron(false);
                 const preset = CRON_PRESETS.find(p => p.value === v);
-                set('schedule_cron', v);
-                set('schedule_label', preset?.label || '');
+                setForm(f => ({ ...f, schedule_cron: v, schedule_label: preset?.label || '' }));
             };
 
             // Run the LLM dry-run
@@ -592,14 +591,14 @@
                                             <label className="label">Source Connection *</label>
                                             <select className="input select" value={form.source_conn_id} onChange={e => set('source_conn_id', e.target.value)}>
                                                 <option value="">— Select source —</option>
-                                                {conns.map(c => <option key={c.id} value={c.id || c.name}>{c.name} ({c.dialect})</option>)}
+                                                {(conns || []).map(c => <option key={c.id} value={c.id || c.name}>{c.name} ({c.dialect})</option>)}
                                             </select>
                                         </div>
                                         <div>
                                             <label className="label">Target Connection *</label>
                                             <select className="input select" value={form.target_conn_id} onChange={e => set('target_conn_id', e.target.value)}>
                                                 <option value="">— Select target —</option>
-                                                {conns.map(c => <option key={c.id} value={c.id || c.name}>{c.name} ({c.dialect})</option>)}
+                                                {(conns || []).map(c => <option key={c.id} value={c.id || c.name}>{c.name} ({c.dialect})</option>)}
                                             </select>
                                         </div>
                                     </div>
@@ -689,6 +688,15 @@
                                                                     }}>
                                                                         No, skip
                                                                     </button>
+                                                                </div>
+                                                            </div>
+                                                        ) : msg.status === 'validation_failed' ? (
+                                                            <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                                                                <span style={{ fontSize: '18px' }}>🚫</span>
+                                                                <div>
+                                                                    <div style={{ fontSize: '12px', fontWeight: 700, color: '#f87171' }}>Prompt Needs Clarification</div>
+                                                                    <div style={{ fontSize: '12px', color: '#fca5a5', marginTop: '4px', whiteSpace: 'pre-wrap' }}>{msg.error}</div>
+                                                                    <div style={{ fontSize: '11px', color: '#fca5a5', marginTop: '8px', opacity: 0.8 }}>Please reply below with more details to continue.</div>
                                                                 </div>
                                                             </div>
                                                         ) : msg.verified ? (
@@ -1257,6 +1265,12 @@
         // ─── App Shell ───────────────────────────────────────────────────────────────
         function App() {
             const [tab, setTab] = useState('dashboard');
+            const [conns, setConns] = useState([]);
+
+            useEffect(() => {
+                API('/api/connections').then(setConns).catch(e => console.error("Failed to load conns:", e));
+            }, []);
+
             const TABS = [
                 { id: 'dashboard', label: '📊 Dashboard' },
                 { id: 'jobs', label: '⚡ Jobs' },
@@ -1281,7 +1295,7 @@
                     {/* Content */}
                     <main style={{ maxWidth: '1400px', margin: '0 auto', padding: '32px 24px' }}>
                         {tab === 'dashboard' && <Dashboard />}
-                        {tab === 'jobs' && <JobsTab />}
+                        {tab === 'jobs' && <JobsTab conns={conns} />}
                         {tab === 'explorer' && <ExplorerTab />}
                         {tab === 'connections' && <ConnectionsTab />}
                     </main>
