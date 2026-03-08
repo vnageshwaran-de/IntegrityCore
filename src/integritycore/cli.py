@@ -2,7 +2,7 @@ import argparse
 import sys
 import os
 import subprocess
-from integritycore.agents.loop import LoopAgent
+from integritycore.agents.graph import build_etl_graph
 from integritycore.core.verifier import ETLStrategy
 
 def main():
@@ -23,12 +23,34 @@ def main():
     print(f"Model Engine: {args.model}")
     print(f"Prompt: {args.prompt}\n")
     
-    agent = LoopAgent(model_name=args.model)
+    graph = build_etl_graph()
+    state_input = {
+        "source_dialect": "POSTGRES",
+        "target_dialect": "SNOWFLAKE",
+        "prompt": args.prompt,
+        "strategy": strategy,
+        "model_name": args.model,
+        "messages": [],
+        "sql": "",
+        "verified": False,
+        "verification_details": "",
+        "special_action": "",
+        "repair_attempts": 0,
+        "max_repairs": 3,
+        "is_dry_run": True,
+        "source_conn": None,
+        "target_conn": None,
+        "executor": None,
+        "logs": []
+    }
     
     try:
-        final_sql = agent.execute_etl_loop(prompt=args.prompt, strategy=strategy)
+        final_state = graph.invoke(state_input)
         print("\n\n=== Final Verified SQL ===")
-        print(final_sql)
+        print(final_state["sql"])
+        print("\n--- Execution Logs ---")
+        for log in final_state.get("logs", []):
+            print(log)
     except Exception as e:
         print(f"\n[Error] Failed to generate verified SQL: {e}")
         sys.exit(1)
