@@ -197,17 +197,38 @@
             const [steps, setSteps] = useState({
                 generate: { status: "pending" },
                 verify: { status: "pending" },
-                repair: { status: "pending" }
+                repair: { status: "pending" },
+                execute: { status: "pending" }
             });
             const [finalSql, setFinalSql] = useState("");
+            const [logs, setLogs] = useState([]);
             const [prompt, setPrompt] = useState("Create an ETL pipeline that loads user active sessions into the analytics schema. Only load sessions that have been updated since the last pipeline run.");
             const [sourceDb, setSourceDb] = useState("");
             const [targetDb, setTargetDb] = useState("");
+            const [model, setModel] = useState("gemini/gemini-2.5-pro");
 
             // Connection Manager State
             const [activeTab, setActiveTab] = useState("dashboard");
             const [connections, setConnections] = useState([]);
-            const [newConn, setNewConn] = useState({ name: "", dialect: "POSTGRESQL", host: "", username: "", password: "" });
+            const [newConn, setNewConn] = useState({ name: "", dialect: "POSTGRESQL", host: "", port: "", database: "", username: "", password: "", account: "", warehouse: "", project_id: "", dataset_id: "", service_account_json: "" });
+            const [testStatuses, setTestStatuses] = useState({});
+            const [editingConn, setEditingConn] = useState(null);
+            const [editForm, setEditForm] = useState({});
+
+            // Explorer state
+            const [exConn, setExConn] = useState(""); // selected connection id
+            const [exTree, setExTree] = useState([]); // [{database, schemas:[]}]
+            const [exSelDb, setExSelDb] = useState("");
+            const [exSelSchema, setExSelSchema] = useState("PUBLIC");
+            const [exTables, setExTables] = useState([]);
+            const [exSelTable, setExSelTable] = useState(null);
+            const [exColumns, setExColumns] = useState([]);
+            const [exPreview, setExPreview] = useState({ columns: [], rows: [] });
+            const [exSubTab, setExSubTab] = useState("schema"); // 'schema' | 'data'
+            const [exSql, setExSql] = useState("SELECT * FROM ZILLOW.PUBLIC.CITY LIMIT 100;");
+            const [exQueryResult, setExQueryResult] = useState(null);
+            const [exLoading, setExLoading] = useState(""); // 'tree'|'tables'|'preview'|'query'|''
+            const [exError, setExError] = useState("");
 
             // Fetch connections on load
             useEffect(() => {
@@ -234,10 +255,127 @@
                         headers: { "Content-Type": "application/json" },
                         body: JSON.stringify(newConn)
                     });
-                    setNewConn({ name: "", dialect: "POSTGRESQL", host: "", username: "", password: "" });
+                    setNewConn({ name: "", dialect: "POSTGRESQL", host: "", port: "", database: "", username: "", password: "", account: "", warehouse: "", project_id: "", dataset_id: "", service_account_json: "" });
                     fetchConnections();
                 } catch (err) {
                     console.error("Error creating connection");
+                }
+            };
+
+            const handleTestConnection = async (id) => {
+                setTestStatuses(prev => ({ ...prev, [id]: { state: 'testing', logs: [] } }));
+                try {
+                    const res = await fetch("/api/connections/test", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({ id })
+                    });
+                    const data = await res.json();
+                    setTestStatuses(prev => ({
+                        ...prev,
+                        [id]: { state: data.status === 'success' ? 'success' : 'error', message: data.message, logs: data.logs || [] }
+                    }));
+                } catch (err) {
+                    setTestStatuses(prev => ({ ...prev, [id]: { state: 'error', message: 'Network timeout.', logs: ['[Test] ❌ Network timeout.'] } }));
+                }
+            };
+
+            const handleEditConnection = (c) => {
+                setEditingConn(c.id);
+                setEditForm({ ...c });
+            };
+
+            const handleSaveConnection = async () => {
+                try {
+                    await fetch(`/api/connections/${editingConn}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(editForm)
+                    });
+                    setEditingConn(null);
+                    fetchConnections();
+                } catch (err) {
+                    console.error('Failed to save connection', err);
+                }
+            };
+
+            // Explorer helpers
+            const exLoadTree = async (connId) => {
+                setExLoading('tree'); setExError('');
+                try {
+                    const r = await fetch(`/api/explore/schemas?conn_id=${connId}`);
+                    if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+                    const data = await r.json();
+                    setExTree(data);
+                    if (data.length > 0) { setExSelDb(data[0].database); }
+                } catch (e) { setExError(String(e)); }
+                setExLoading('');
+            };
+
+            const exLoadTables = async (connId, db, schema) => {
+                setExLoading('tables'); setExError(''); setExSelTable(null); setExColumns([]); setExPreview({ columns: [], rows: [] });
+                try {
+                    const r = await fetch(`/api/explore/tables?conn_id=${connId}&database=${db}&schema=${schema}`);
+                    if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+                    const data = await r.json();
+                    setExTables(data.tables);
+                } catch (e) { setExError(String(e)); }
+                setExLoading('');
+            };
+
+            const exSelectTable = async (tableName) => {
+                setExSelTable(tableName); setExLoading('preview'); setExError('');
+                try {
+                    const base = `conn_id=${exConn}&database=${exSelDb}&schema=${exSelSchema}&table=${tableName}`;
+                    const [colRes, preRes] = await Promise.all([
+                        fetch(`/api/explore/columns?${base}`),
+                        fetch(`/api/explore/preview?${base}&limit=50`)
+                    ]);
+                    const colData = await colRes.json();
+                    const preData = await preRes.json();
+                    setExColumns(colData.columns || []);
+                    setExPreview(preData);
+                    setExSubTab('data');
+                } catch (e) { setExError(String(e)); }
+                setExLoading('');
+            };
+
+            const exRunQuery = async () => {
+                setExLoading('query'); setExError(''); setExQueryResult(null);
+                try {
+                    const r = await fetch('/api/explore/query', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ conn_id: exConn, sql: exSql })
+                    });
+                    if (!r.ok) { const e = await r.json(); throw new Error(e.detail); }
+                    setExQueryResult(await r.json());
+                } catch (e) { setExError(String(e)); }
+                setExLoading('');
+            };
+
+            React.useEffect(() => {
+                if (exConn) exLoadTree(exConn);
+            }, [exConn]);
+
+            React.useEffect(() => {
+                if (exConn && exSelDb && exSelSchema) exLoadTables(exConn, exSelDb, exSelSchema);
+            }, [exSelDb, exSelSchema]);
+
+            const handleDeleteConnection = async (id) => {
+                if (!window.confirm("Are you sure you want to delete this connection?")) return;
+
+                try {
+                    const res = await fetch(`/api/connections/${id}`, {
+                        method: "DELETE"
+                    });
+                    if (res.ok) {
+                        fetchConnections();
+                    } else {
+                        console.error("Failed to delete connection.");
+                    }
+                } catch (err) {
+                    console.error("Error deleting connection", err);
                 }
             };
 
@@ -250,6 +388,7 @@
 
                     if (data.final_sql) setFinalSql(data.final_sql);
                     if (data.error) setErrorMsg(data.error);
+                    if (data.logs) setLogs(data.logs);
 
                     if (data.status === "running") {
                         setTimeout(pollStatus, 1500);
@@ -263,10 +402,12 @@
                 setStatus("running");
                 setFinalSql("");
                 setErrorMsg("");
+                setLogs([]);
                 setSteps({
                     generate: { status: "running" },
                     verify: { status: "pending" },
-                    repair: { status: "pending" }
+                    repair: { status: "pending" },
+                    execute: { status: "pending" }
                 });
 
                 try {
@@ -276,7 +417,7 @@
                         body: JSON.stringify({
                             prompt: prompt,
                             strategy: "INCREMENTAL",
-                            model: "gemini/gemini-2.5-pro",
+                            model: model,
                             source: sourceDb,
                             target: targetDb
                         })
@@ -321,6 +462,11 @@
                                 className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all ${activeTab === "connections" ? "bg-brand-500 text-white shadow-lg" : "text-slate-400 hover:text-white"}`}>
                                 Connections
                             </button>
+                            <button
+                                onClick={() => setActiveTab("explorer")}
+                                className={`px-4 py-1.5 rounded-md text-sm font-semibold transition-all ${activeTab === "explorer" ? "bg-brand-500 text-white shadow-lg" : "text-slate-400 hover:text-white"}`}>
+                                🔍 Explorer
+                            </button>
                         </div>
                         <div className="flex space-x-5 text-sm font-medium">
                             <div className="flex items-center text-emerald-400 group"><span className="w-2.5 h-2.5 bg-emerald-500 rounded-full inline-block mr-2 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></span> Success</div>
@@ -359,9 +505,10 @@
                                     <div className="grid grid-cols-2 gap-3">
                                         <div>
                                             <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase tracking-wider">Engine (via ADK)</label>
-                                            <select className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
-                                                <option>gemini/gemini-2.5-pro</option>
-                                                <option>gpt-4-turbo</option>
+                                            <select value={model} onChange={(e) => setModel(e.target.value)} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-xs text-slate-200 focus:outline-none focus:ring-1 focus:ring-brand-500">
+                                                <option value="gemini/gemini-2.5-pro">Gemini 2.5 Pro</option>
+                                                <option value="anthropic/claude-3-5-sonnet-20241022">Claude 3.5 Sonnet</option>
+                                                <option value="gpt-4-turbo">GPT-4 Turbo</option>
                                             </select>
                                         </div>
 
@@ -387,8 +534,8 @@
                                 <button
                                     onClick={runDag}
                                     disabled={status === "running"}
-                                    className={`w-full mt-6 text-white font-bold py-3.5 px-4 rounded-lg transition-all flex items-center justify-center
-                                    ${status === "running" ? 'bg-brand-800 cursor-not-allowed border border-brand-700' : 'bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 shadow-[0_0_15px_rgba(79,70,229,0.4)] border border-transparent group hover:-translate-y-0.5'}`}>
+                                    className={`w-full mt-6 text-white font-bold py-3.5 px-4 rounded-lg transition-all flex items-center justify-center shadow-md
+                                    ${status === "running" ? 'bg-brand-800 cursor-not-allowed border border-brand-700' : 'bg-gradient-to-r from-brand-600 to-indigo-600 hover:from-brand-500 hover:to-indigo-500 border border-transparent group hover:-translate-y-0.5 hover:shadow-lg'}`}>
 
                                     {status === "running" ? (
                                         <><svg className="animate-spin -ml-1 mr-3 h-5 w-5 text-white" fill="none" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg> Executing DAG...</>
@@ -447,12 +594,23 @@
                                             </div>
 
                                             {/* Repair Node */}
-                                            <div className={`dag-node ${getNodeClass(steps.repair.status)} ${steps.repair.status !== 'pending' ? 'transition-all duration-500 opacity-100 scale-100' : 'opacity-0 scale-95 transform hidden'}`}>
+                                            <div className={`dag-node ${getNodeClass(steps.repair?.status || 'pending')} ${(steps.repair?.status || 'pending') !== 'pending' ? 'transition-all duration-500 opacity-100 scale-100' : 'opacity-0 scale-95 transform hidden'}`}>
                                                 <div>
                                                     <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Stage 3</div>
                                                     <div className="font-semibold text-slate-100">Autonomic Repair</div>
                                                 </div>
                                                 <div className="ml-4 text-[10px] bg-orange-900/40 border border-orange-700/50 px-2 py-1 rounded text-orange-200 font-mono">ADK</div>
+                                            </div>
+
+                                            <div className={`arrow ${genToVerifyArrow}`} style={{ opacity: steps.execute?.status && steps.execute.status !== 'pending' ? 1 : 0 }}></div>
+
+                                            {/* Execute Node */}
+                                            <div className={`dag-node ${getNodeClass(steps.execute?.status || 'pending')} ${(steps.execute?.status || 'pending') !== 'pending' ? 'opacity-100 scale-100' : 'opacity-0 scale-95 transform'}`}>
+                                                <div>
+                                                    <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-0.5">Stage 4</div>
+                                                    <div className="font-semibold text-slate-100">Physical Deploy</div>
+                                                </div>
+                                                <div className="ml-4 text-[10px] bg-teal-900/40 border border-teal-700/50 px-2 py-1 rounded text-teal-200 font-mono whitespace-nowrap">ETL Sync</div>
                                             </div>
 
                                         </div>
@@ -471,9 +629,13 @@
                                     </div>
 
                                     <div className="font-mono text-xs overflow-y-auto flex-1 pr-2 leading-relaxed space-y-1.5">
-                                        {status === "idle" && <div className="text-slate-600 italic">user@ic-daemon:~# waiting for DAG trigger trigger...</div>}
+                                        {status === "idle" && <div className="text-slate-600 italic">user@ic-daemon:~# waiting for DAG trigger...</div>}
 
-                                        {status === "running" && (
+                                        {logs.map((logStr, i) => (
+                                            <div key={i} className="text-emerald-400/80 terminal-text w-full">[+] {logStr}</div>
+                                        ))}
+
+                                        {status === "running" && logs.length === 0 && (
                                             <>
                                                 <div className="text-emerald-400/80 animate-typewriter terminal-text w-full">[+] System: Polling agent state via Model Context Protocol...</div>
                                                 <div className="text-emerald-400/80 animate-typewriter terminal-text w-full" style={{ animationDelay: "1.5s" }}>[+] MCP: Synchronizing Postgres / Snowflake Adapters...</div>
@@ -515,12 +677,215 @@
                         </main>
                     )}
 
+                    {/* ── EXPLORER TAB ────────────────────────────────────────── */}
+                    {activeTab === "explorer" && (
+                        <div className="flex-1 flex flex-col p-6 gap-4 w-full max-w-screen-2xl mx-auto overflow-hidden" style={{ height: 'calc(100vh - 64px)' }}>
+
+                            {/* Top bar: connection selector */}
+                            <div className="glass-panel rounded-xl p-4 flex items-center gap-4 border border-slate-700/50">
+                                <span className="text-slate-400 text-sm font-semibold uppercase tracking-widest whitespace-nowrap">🔌 Connection</span>
+                                <select value={exConn} onChange={e => setExConn(e.target.value)}
+                                    className="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-slate-200 text-sm focus:outline-none focus:border-brand-500">
+                                    <option value="">-- Select a Snowflake connection --</option>
+                                    {connections.filter(c => c.dialect === 'SNOWFLAKE').map(c => (
+                                        <option key={c.id} value={c.id}>{c.name} ({c.dialect})</option>
+                                    ))}
+                                </select>
+                                {exLoading && <span className="text-xs text-amber-400 animate-pulse font-mono">{exLoading === 'tree' ? 'Loading schema tree...' : exLoading === 'tables' ? 'Loading tables...' : exLoading === 'preview' ? 'Loading preview...' : 'Running query...'}</span>}
+                                {exError && <span className="text-xs text-rose-400 font-mono truncate max-w-xs" title={exError}>⚠ {exError}</span>}
+                                {exConn && (
+                                    <>
+                                        <button onClick={() => exLoadTree(exConn)} disabled={!!exLoading}
+                                            title="Reload all databases & schemas"
+                                            className="text-[10px] font-bold px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white transition-colors disabled:opacity-40 whitespace-nowrap">
+                                            🔄 Refresh Tree
+                                        </button>
+                                        <button onClick={async () => {
+                                            await fetch(`/api/explore/pool/${exConn}`, { method: 'DELETE' });
+                                            setExTree([]); setExTables([]); setExSelTable(null); setExColumns([]); setExPreview({ columns: [], rows: [] });
+                                            setExError('Disconnected — select connection again to reconnect (Duo MFA will re-prompt)');
+                                        }}
+                                            title="Close the persistent Snowflake connection"
+                                            className="text-[10px] font-bold px-3 py-1.5 rounded bg-rose-900/60 hover:bg-rose-800 text-rose-400 hover:text-rose-200 border border-rose-800/50 transition-colors whitespace-nowrap">
+                                            ⏏ Disconnect
+                                        </button>
+                                    </>
+                                )}
+                            </div>
+
+                            {/* Main 3-pane layout */}
+                            <div className="flex-1 flex gap-4 overflow-hidden min-h-0">
+
+                                {/* LEFT: Schema tree */}
+                                <div className="w-72 glass-panel rounded-xl border border-slate-700/50 flex flex-col overflow-hidden">
+                                    <div className="px-4 py-3 border-b border-slate-700 flex items-center">
+                                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest flex-1">Schema Browser</span>
+                                        {exConn && exSelDb && exSelSchema && (
+                                            <button onClick={() => exLoadTables(exConn, exSelDb, exSelSchema)} disabled={!!exLoading}
+                                                title="Reload tables in current schema"
+                                                className="text-[9px] px-2 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-400 hover:text-white transition-colors disabled:opacity-40">
+                                                🔄
+                                            </button>
+                                        )}
+                                    </div>
+                                    <div className="overflow-y-auto flex-1 p-2 text-xs">
+                                        {!exConn && <div className="text-slate-600 italic p-3">Select a connection above</div>}
+                                        {exConn && exTree.length === 0 && !exLoading && <div className="text-slate-600 italic p-3">No databases found</div>}
+                                        {exTree.map(dbEntry => (
+                                            <div key={dbEntry.database} className="mb-1">
+                                                <div className={`flex items-center gap-1 px-2 py-1 rounded cursor-pointer font-bold text-slate-300 hover:bg-slate-700/50 ${exSelDb === dbEntry.database ? 'bg-slate-700/50 text-brand-400' : ''}`}
+                                                    onClick={() => setExSelDb(dbEntry.database)}>
+                                                    🗄 {dbEntry.database}
+                                                </div>
+                                                {exSelDb === dbEntry.database && dbEntry.schemas.map(schema => (
+                                                    <div key={schema}>
+                                                        <div className={`flex items-center gap-1 px-3 py-1 rounded cursor-pointer text-slate-400 hover:bg-slate-700/40 ${exSelSchema === schema ? 'bg-slate-700/40 text-emerald-400' : ''}`}
+                                                            onClick={() => setExSelSchema(schema)}>
+                                                            📁 {schema}
+                                                        </div>
+                                                        {exSelSchema === schema && exTables.map(tbl => (
+                                                            <div key={tbl.name}
+                                                                onClick={() => exSelectTable(tbl.name)}
+                                                                className={`flex items-center gap-2 px-5 py-1 rounded cursor-pointer text-slate-500 hover:text-slate-200 hover:bg-slate-700/30 ${exSelTable === tbl.name ? 'text-amber-300 bg-slate-700/30' : ''}`}>
+                                                                <span>{tbl.kind === 'view' ? '👁' : '📋'}</span>
+                                                                <span className="truncate">{tbl.name}</span>
+                                                                {tbl.rows !== null && <span className="ml-auto text-[9px] text-slate-600">{Number(tbl.rows).toLocaleString()}</span>}
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                ))}
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* RIGHT: Detail panel */}
+                                <div className="flex-1 flex flex-col gap-4 overflow-hidden min-h-0">
+
+                                    {/* Table detail card */}
+                                    <div className="glass-panel rounded-xl border border-slate-700/50 flex flex-col overflow-hidden" style={{ flex: '0 0 auto', maxHeight: '45%' }}>
+                                        <div className="flex items-center gap-2 px-4 py-2 border-b border-slate-700 bg-slate-900/50">
+                                            {exSelTable ? (
+                                                <>
+                                                    <span className="text-slate-300 font-semibold text-sm mr-2">{exSelDb}.{exSelSchema}.<span className="text-amber-300">{exSelTable}</span></span>
+                                                    <button onClick={() => setExSubTab('schema')} className={`text-[10px] uppercase font-bold px-3 py-1 rounded transition-colors ${exSubTab === 'schema' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white'}`}>Schema</button>
+                                                    <button onClick={() => setExSubTab('data')} className={`text-[10px] uppercase font-bold px-3 py-1 rounded transition-colors ${exSubTab === 'data' ? 'bg-brand-600 text-white' : 'text-slate-400 hover:text-white'}`}>Data ({exPreview.count || 0} rows)</button>
+                                                    <button onClick={() => { setExSql(`SELECT * FROM ${exSelDb}.${exSelSchema}.${exSelTable} LIMIT 100;`); setExSubTab('schema'); }}
+                                                        className="ml-auto text-[10px] px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-400 hover:text-white">Open in Workshop ↓</button>
+                                                </>
+                                            ) : (
+                                                <span className="text-slate-600 text-xs italic">Click a table in the tree to explore it</span>
+                                            )}
+                                        </div>
+                                        <div className="overflow-auto flex-1">
+                                            {exSubTab === 'schema' && exColumns.length > 0 && (
+                                                <table className="w-full text-xs">
+                                                    <thead className="sticky top-0 bg-slate-900">
+                                                        <tr className="text-left text-[10px] text-slate-500 uppercase border-b border-slate-700">
+                                                            <th className="px-4 py-2 font-bold">#</th>
+                                                            <th className="px-4 py-2 font-bold">Column</th>
+                                                            <th className="px-4 py-2 font-bold">Type</th>
+                                                            <th className="px-4 py-2 font-bold">Nullable</th>
+                                                            <th className="px-4 py-2 font-bold">Default</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {exColumns.map((col, i) => (
+                                                            <tr key={i} className="border-b border-slate-800/60 hover:bg-slate-800/40">
+                                                                <td className="px-4 py-2 text-slate-600 font-mono">{i + 1}</td>
+                                                                <td className="px-4 py-2 font-mono font-semibold text-slate-200">{col.name}</td>
+                                                                <td className="px-4 py-2 font-mono text-teal-400">{col.type}</td>
+                                                                <td className="px-4 py-2 text-slate-400">{col.nullable}</td>
+                                                                <td className="px-4 py-2 text-slate-500">{col.default || '—'}</td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            )}
+                                            {exSubTab === 'data' && exPreview.columns.length > 0 && (
+                                                <table className="w-full text-xs">
+                                                    <thead className="sticky top-0 bg-slate-900">
+                                                        <tr className="text-left text-[10px] text-slate-500 uppercase border-b border-slate-700">
+                                                            {exPreview.columns.map((col, i) => (
+                                                                <th key={i} className="px-3 py-2 font-bold whitespace-nowrap">{col}</th>
+                                                            ))}
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {exPreview.rows.map((row, ri) => (
+                                                            <tr key={ri} className="border-b border-slate-800/40 hover:bg-slate-800/40">
+                                                                {row.map((cell, ci) => (
+                                                                    <td key={ci} className="px-3 py-1.5 text-slate-300 font-mono max-w-[200px] truncate" title={String(cell ?? '')}>{String(cell ?? '')}</td>
+                                                                ))}
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            )}
+                                            {exSelTable && exLoading === 'preview' && <div className="p-6 text-center text-amber-400 text-sm animate-pulse">Loading table data...</div>}
+                                        </div>
+                                    </div>
+
+                                    {/* SQL Workshop */}
+                                    <div className="glass-panel rounded-xl border border-slate-700/50 flex flex-col overflow-hidden flex-1 min-h-0">
+                                        <div className="flex items-center gap-3 px-4 py-2 border-b border-slate-700 bg-slate-900/60">
+                                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-widest">⚡ SQL Workshop</span>
+                                            {exQueryResult && (
+                                                <span className="text-[10px] font-mono text-emerald-400 bg-emerald-900/30 border border-emerald-800/50 px-2 py-0.5 rounded">
+                                                    {exQueryResult.rows.length} rows · {exQueryResult.duration_ms}ms
+                                                </span>
+                                            )}
+                                            <button onClick={exRunQuery} disabled={!exConn || exLoading === 'query'}
+                                                className="ml-auto text-[11px] font-bold px-4 py-1.5 rounded bg-brand-600 hover:bg-brand-500 text-white transition-colors disabled:opacity-50">
+                                                {exLoading === 'query' ? '⏳ Running...' : '▶ Run Query'}
+                                            </button>
+                                        </div>
+                                        <textarea value={exSql} onChange={e => setExSql(e.target.value)}
+                                            className="font-mono text-xs text-amber-300 bg-slate-950 p-4 resize-none outline-none border-b border-slate-700"
+                                            style={{ height: '80px' }}
+                                            placeholder="SELECT * FROM DATABASE.SCHEMA.TABLE LIMIT 100;"
+                                            spellCheck={false}
+                                        />
+                                        <div className="overflow-auto flex-1">
+                                            {exQueryResult && exQueryResult.columns.length > 0 && (
+                                                <table className="w-full text-xs">
+                                                    <thead className="sticky top-0 bg-slate-900">
+                                                        <tr className="text-left text-[10px] text-slate-500 uppercase border-b border-slate-700">
+                                                            {exQueryResult.columns.map((col, i) => (
+                                                                <th key={i} className="px-3 py-2 font-bold whitespace-nowrap">{col}</th>
+                                                            ))}
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {exQueryResult.rows.map((row, ri) => (
+                                                            <tr key={ri} className="border-b border-slate-800/40 hover:bg-slate-800/40">
+                                                                {row.map((cell, ci) => (
+                                                                    <td key={ci} className="px-3 py-1.5 text-slate-300 font-mono max-w-[200px] truncate" title={String(cell ?? '')}>{String(cell ?? '')}</td>
+                                                                ))}
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            )}
+                                            {exQueryResult && exQueryResult.columns.length === 0 && (
+                                                <div className="p-4 text-sm text-emerald-400">✅ Query executed — {exQueryResult.rows_affected} rows affected in {exQueryResult.duration_ms}ms</div>
+                                            )}
+                                            {!exQueryResult && !exLoading && (
+                                                <div className="p-4 text-slate-600 text-xs italic">Write SQL above and click Run Query to see results here</div>
+                                            )}
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {/* Connections View */}
                     {activeTab === "connections" && (
                         <div className="max-w-7xl mx-auto flex-1 p-6 grid grid-cols-1 md:grid-cols-3 gap-6 w-full pt-10">
 
                             {/* Connection Form */}
-                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-2xl col-span-1 h-fit">
+                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-md col-span-1 h-fit">
                                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-teal-500 to-emerald-500"></div>
                                 <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide mb-6">New Database</h2>
 
@@ -538,38 +903,108 @@
                                             <option value="MYSQL">MySQL</option>
                                         </select>
                                     </div>
-                                    <div>
-                                        <label className="block text-xs font-semibold text-slate-400 mb-1.5 uppercase">Host / URI</label>
-                                        <input required type="text" value={newConn.host} onChange={e => setNewConn({ ...newConn, host: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="postgres://..." />
-                                    </div>
-                                    <div className="grid grid-cols-2 gap-3">
-                                        <div>
-                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Username</label>
-                                            <input type="text" value={newConn.username} onChange={e => setNewConn({ ...newConn, username: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
-                                        </div>
-                                        <div>
-                                            <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Password</label>
-                                            <input type="password" value={newConn.password} onChange={e => setNewConn({ ...newConn, password: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
-                                        </div>
-                                    </div>
-                                    <button type="submit" className="w-full bg-teal-600 hover:bg-teal-500 text-white font-bold py-3 px-4 rounded transition-all mt-4 font-mono text-sm shadow-[0_0_15px_rgba(20,184,166,0.5)]">
+
+                                    {['POSTGRESQL', 'MYSQL'].includes(newConn.dialect) && (
+                                        <>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Host / URI</label>
+                                                    <input required type="text" value={newConn.host} onChange={e => setNewConn({ ...newConn, host: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="postgres://..." />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Port</label>
+                                                    <input type="text" value={newConn.port} onChange={e => setNewConn({ ...newConn, port: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="5432" />
+                                                </div>
+                                            </div>
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Database</label>
+                                                <input type="text" value={newConn.database} onChange={e => setNewConn({ ...newConn, database: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="analytics_db" />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Username</label>
+                                                    <input type="text" value={newConn.username} onChange={e => setNewConn({ ...newConn, username: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Password</label>
+                                                    <input type="password" value={newConn.password} onChange={e => setNewConn({ ...newConn, password: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                            </div>
+                                        </>
+                                    )}
+
+                                    {newConn.dialect === 'SNOWFLAKE' && (
+                                        <>
+                                            <div>
+                                                <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Account Locator</label>
+                                                <input required type="text" value={newConn.account} onChange={e => setNewConn({ ...newConn, account: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="xy12345.us-east-1" />
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3 mt-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Database</label>
+                                                    <input type="text" value={newConn.database} onChange={e => setNewConn({ ...newConn, database: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Warehouse</label>
+                                                    <input type="text" value={newConn.warehouse} onChange={e => setNewConn({ ...newConn, warehouse: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                            </div>
+                                            <div className="grid grid-cols-2 gap-3 mt-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Username</label>
+                                                    <input type="text" value={newConn.username} onChange={e => setNewConn({ ...newConn, username: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Password</label>
+                                                    <input type="password" value={newConn.password} onChange={e => setNewConn({ ...newConn, password: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                                </div>
+                                            </div>
+                                        </>
+                                    )}
+
+                                    {newConn.dialect === 'BIGQUERY' && (
+                                        <>
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Project ID</label>
+                                                    <input required type="text" value={newConn.project_id} onChange={e => setNewConn({ ...newConn, project_id: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="my-gcp-project" />
+                                                </div>
+                                                <div>
+                                                    <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Dataset ID</label>
+                                                    <input required type="text" value={newConn.dataset_id} onChange={e => setNewConn({ ...newConn, dataset_id: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" placeholder="analytics_ds" />
+                                                </div>
+                                            </div>
+                                            <div className="mt-3">
+                                                <label className="block text-[10px] font-bold text-slate-400 mb-1.5 uppercase">Service Account JSON (Base64)</label>
+                                                <input type="password" value={newConn.service_account_json} onChange={e => setNewConn({ ...newConn, service_account_json: e.target.value })} className="w-full border border-slate-600 rounded p-2 bg-slate-800/80 text-slate-200 focus:ring-1 focus:ring-teal-500 text-sm" />
+                                            </div>
+                                        </>
+                                    )}
+
+                                    <button type="submit" className="w-full bg-teal-600 hover:bg-teal-500 text-white font-bold py-3 px-4 rounded transition-all mt-4 font-mono text-sm shadow-md hover:shadow-lg">
                                         SAVE CONNECTION
                                     </button>
                                 </form>
                             </div>
 
                             {/* Configured Connections Table */}
-                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-2xl col-span-2">
+                            <div className="glass-panel rounded-2xl p-6 flex flex-col relative overflow-hidden border border-slate-700/50 shadow-md col-span-2">
                                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-slate-600 to-slate-500"></div>
-                                <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide mb-6">Configured Adapters</h2>
+                                <div className="flex items-center mb-6">
+                                    <h2 className="text-lg font-bold text-slate-100 uppercase tracking-wide flex-1">Configured Adapters</h2>
+                                    <button onClick={fetchConnections}
+                                        className="text-[10px] font-bold px-3 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 hover:text-white transition-colors">
+                                        🔄 Refresh
+                                    </button>
+                                </div>
 
                                 <div className="overflow-y-auto flex-1 h-full">
                                     <table className="w-full text-left border-collapse">
                                         <thead>
                                             <tr className="border-b border-slate-700 text-xs font-bold text-slate-400 uppercase tracking-wider">
-                                                <th className="pb-3 text-left">Name</th>
-                                                <th className="pb-3 text-left">Dialect</th>
-                                                <th className="pb-3 text-left w-64 max-w-sm">Host</th>
+                                                <th className="pb-3 text-left w-1/4">Name</th>
+                                                <th className="pb-3 text-left w-1/6">Dialect</th>
+                                                <th className="pb-3 text-left w-1/2">Details</th>
                                                 <th className="pb-3 text-right">Status</th>
                                             </tr>
                                         </thead>
@@ -578,16 +1013,79 @@
                                                 <tr><td colSpan="4" className="py-8 text-center text-slate-500 italic">No connections configured yet.</td></tr>
                                             )}
                                             {connections.map(c => (
-                                                <tr key={c.id} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
-                                                    <td className="py-4 font-semibold text-slate-200">{c.name}</td>
-                                                    <td className="py-4 text-brand-400 font-mono text-[10px] font-bold">{c.dialect}</td>
-                                                    <td className="py-4 text-slate-400 truncate w-64 max-w-sm font-mono text-xs">{c.host}</td>
-                                                    <td className="py-4 text-right">
-                                                        <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-emerald-900/40 text-emerald-400 border border-emerald-800/50 uppercase">
-                                                            Connected
-                                                        </span>
-                                                    </td>
-                                                </tr>
+                                                <React.Fragment key={c.id}>
+                                                    <tr className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                                                        <td className="py-4 font-semibold text-slate-200">{c.name}</td>
+                                                        <td className="py-4 text-brand-400 font-mono text-[10px] font-bold">{c.dialect}</td>
+                                                        <td className="py-4 text-slate-400 truncate max-w-[200px] font-mono text-xs">
+                                                            {c.dialect === 'SNOWFLAKE' ? c.account : (c.dialect === 'BIGQUERY' ? c.project_id : (c.host || '') + (c.port ? ':' + c.port : ''))}
+                                                        </td>
+                                                        <td className="py-4 text-right">
+                                                            <div className="flex gap-2 justify-end items-center">
+                                                                {testStatuses[c.id]?.state === 'testing' && (
+                                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-amber-900/40 text-amber-400 border border-amber-800/50 uppercase animate-pulse">Connecting...</span>
+                                                                )}
+                                                                {testStatuses[c.id]?.state === 'success' && (
+                                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-emerald-900/40 text-emerald-400 border border-emerald-800/50 uppercase">✅ Verified</span>
+                                                                )}
+                                                                {testStatuses[c.id]?.state === 'error' && (
+                                                                    <span className="inline-flex items-center px-2 py-0.5 rounded text-[9px] font-bold bg-red-900/40 text-red-400 border border-red-800/50 uppercase">❌ Failed</span>
+                                                                )}
+                                                                <button onClick={() => handleEditConnection(c)} className="text-[10px] uppercase font-bold text-slate-400 hover:text-indigo-400 transition-colors border border-slate-700 hover:border-indigo-500 rounded px-2 py-[2px] bg-slate-800/80 shadow-sm">
+                                                                    Edit
+                                                                </button>
+                                                                <button onClick={() => handleTestConnection(c.id)} disabled={testStatuses[c.id]?.state === 'testing'} className="text-[10px] uppercase font-bold text-slate-400 hover:text-teal-400 transition-colors border border-slate-700 hover:border-teal-500 rounded px-2 py-[2px] bg-slate-800/80 shadow-sm disabled:opacity-50">
+                                                                    Test
+                                                                </button>
+                                                                <button onClick={() => handleDeleteConnection(c.id)} className="text-[10px] uppercase font-bold text-slate-400 hover:text-red-400 transition-colors border border-slate-700 hover:border-red-500 rounded px-2 py-[2px] bg-slate-800/80 shadow-sm" title="Delete Connection">
+                                                                    ✕
+                                                                </button>
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+
+                                                    {/* Inline Edit Form */}
+                                                    {editingConn === c.id && (
+                                                        <tr className="bg-slate-800/50">
+                                                            <td colSpan="4" className="p-4">
+                                                                <div className="border border-indigo-700/50 rounded-lg p-4 space-y-3">
+                                                                    <div className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest mb-2">✏️ Edit Connection: {c.name}</div>
+                                                                    <div className="grid grid-cols-2 gap-3">
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Name</label><input value={editForm.name || ''} onChange={e => setEditForm({ ...editForm, name: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" /></div>
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Account Locator</label><input value={editForm.account || ''} onChange={e => setEditForm({ ...editForm, account: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" placeholder="e.g. jxoylzi-zfb85046" /></div>
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Username</label><input value={editForm.username || ''} onChange={e => setEditForm({ ...editForm, username: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" /></div>
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Password</label><input type="password" value={editForm.password || ''} onChange={e => setEditForm({ ...editForm, password: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" /></div>
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Database</label><input value={editForm.database || ''} onChange={e => setEditForm({ ...editForm, database: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" /></div>
+                                                                        <div><label className="block text-[10px] text-slate-400 mb-1 uppercase">Warehouse</label><input value={editForm.warehouse || ''} onChange={e => setEditForm({ ...editForm, warehouse: e.target.value })} className="w-full border border-slate-600 rounded p-1.5 bg-slate-900 text-slate-200 text-xs" /></div>
+                                                                    </div>
+                                                                    <div className="flex gap-2 mt-2">
+                                                                        <button onClick={handleSaveConnection} className="text-[11px] font-bold px-4 py-1.5 rounded bg-indigo-600 hover:bg-indigo-500 text-white transition-colors">Save Changes</button>
+                                                                        <button onClick={() => setEditingConn(null)} className="text-[11px] font-bold px-4 py-1.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-300 transition-colors">Cancel</button>
+                                                                    </div>
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    )}
+
+                                                    {/* Connection Test Logs Terminal */}
+                                                    {testStatuses[c.id]?.logs?.length > 0 && (
+                                                        <tr className="bg-black/40">
+                                                            <td colSpan="4" className="px-4 pb-4 pt-2">
+                                                                <div className="border border-slate-700 rounded-lg overflow-hidden">
+                                                                    <div className="bg-slate-900/80 px-3 py-1.5 text-[9px] font-bold text-slate-500 uppercase tracking-widest border-b border-slate-700 flex justify-between">
+                                                                        <span>⚡ Connection Test Log — {c.name}</span>
+                                                                        <button onClick={() => setTestStatuses(prev => { const n = { ...prev }; delete n[c.id]; return n; })} className="text-slate-600 hover:text-slate-400">✕</button>
+                                                                    </div>
+                                                                    <div className="p-3 font-mono text-[11px] space-y-0.5 max-h-48 overflow-y-auto">
+                                                                        {testStatuses[c.id].logs.map((line, i) => (
+                                                                            <div key={i} className={`${line.includes('❌') ? 'text-rose-400' : line.includes('✅') ? 'text-emerald-400' : 'text-slate-300'}`}>{line}</div>
+                                                                        ))}
+                                                                    </div>
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    )}
+                                                </React.Fragment>
                                             ))}
                                         </tbody>
                                     </table>

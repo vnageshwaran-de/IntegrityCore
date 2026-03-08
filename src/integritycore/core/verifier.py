@@ -14,7 +14,7 @@ class LogicVerifier:
         """
         self.model_name = model_name
     
-    def verify_generation(self, generated_sql: str, strategy: ETLStrategy) -> bool:
+    def verify_generation(self, generated_sql: str, strategy: ETLStrategy, log_cb=None) -> bool:
         """
         Verifies if the generated SQL satisfies the mathematical constraints required by the ETL strategy.
         """
@@ -26,8 +26,9 @@ class LogicVerifier:
             # to be evaluated rigorously by our AST/Z3 engine.
             prompt = (
                 "Extract the quantitative WHERE clause filtering logic from this SQL code "
-                "as a raw Python boolean expression (e.g., 'updated_at >= watermark'). "
-                "Do not include explanation or markdown code block syntax. Only the expression.\n\n"
+                "as a raw Python boolean expression. "
+                "CRITICAL: You MUST normalize the left-hand timestamp column to 'updated_at' and the right-hand threshold value/variable to 'watermark' (e.g., 'updated_at >= watermark'). "
+                "Do not include SQL keywords like WHERE, AND, etc. Do not include explanation or markdown code block syntax. Only the pure Python comparison expression.\n\n"
                 f"SQL:\n{generated_sql}"
             )
             
@@ -40,16 +41,18 @@ class LogicVerifier:
             # Fallback cleaning for markdown codeblocks if present
             if extracted_expr.startswith("```"):
                 extracted_expr = "\n".join(extracted_expr.split("\n")[1:-1])
-                
-            return self._verify_incremental_logic(extracted_expr)
+            return self._verify_incremental_logic(extracted_expr, log_cb=log_cb)
             
         return False
 
-    def _verify_incremental_logic(self, python_expr: str) -> bool:
+    def _verify_incremental_logic(self, python_expr: str, log_cb=None) -> bool:
         """
         Uses z3-solver and the python ast to ensure the incremental condition (updated_at >= watermark)
         is strongly satisfied by the generated logic.
         """
+        msg = f"[Verifier] Extracted python expression for AST: '{python_expr}'"
+        if log_cb: log_cb(msg)
+        else: print(msg)
         try:
             tree = ast.parse(python_expr, mode='eval')
             z3_expr = self._ast_to_z3(tree.body)
