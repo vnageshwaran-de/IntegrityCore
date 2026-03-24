@@ -11,6 +11,7 @@ import os, asyncio, concurrent.futures, threading, datetime, logging
 from integritycore.adapters.connections import ConnectionManager, DBConnection
 from integritycore.db.engine import init_db, get_db
 from integritycore.db.models import Job, JobRun, JobStatus, RunStatus
+from integritycore.db.gold_queries import add_gold_query
 from integritycore.metadata.manager import MetadataManager
 import integritycore.scheduler.runner as scheduler
 
@@ -18,16 +19,32 @@ log = logging.getLogger("integritycore.api")
 
 # ── Metadata Manager (Enterprise Semantic Catalog) ─────────────────────────────
 _metadata_manager: Optional[MetadataManager] = None
+_metadata_manager_error: Optional[str] = None
+
+# Harvest status: conn_id -> {status, started_at, completed_at, table_count, error}
+_harvest_status: dict = {}
+# Harvest logs: conn_id -> list of {ts, msg} for live progress
+_harvest_logs: dict = {}
+# Harvest cancel: conn_id -> True when user requested stop
+_harvest_cancel_requested: dict = {}
+_harvest_lock = threading.Lock()
 
 def get_metadata_manager() -> Optional[MetadataManager]:
     """FastAPI dependency: MetadataManager for catalog browse and grounding."""
-    global _metadata_manager
-    if _metadata_manager is None:
+    global _metadata_manager, _metadata_manager_error
+    if _metadata_manager is None and _metadata_manager_error is None:
         try:
             _metadata_manager = MetadataManager()
         except Exception as e:
+            _metadata_manager_error = str(e)
             log.warning("MetadataManager not available: %s", e)
     return _metadata_manager
+
+def get_metadata_catalog_error() -> str:
+    """Return the last init error for helpful error messages."""
+    if _metadata_manager_error:
+        return _metadata_manager_error
+    return "Metadata catalog not available. Install: pip install duckdb lancedb pyarrow"
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
 
@@ -53,6 +70,8 @@ class JobCreate(BaseModel):
     source_conn_id: str
     target_conn_id: str
     prompt: str
+    selected_source_table: Optional[str] = None
+    selected_target_table: Optional[str] = None
     schedule_cron: Optional[str] = ""
     schedule_label: Optional[str] = ""
     status: Optional[str] = JobStatus.ACTIVE
@@ -63,6 +82,8 @@ class JobUpdate(BaseModel):
     source_conn_id: Optional[str] = None
     target_conn_id: Optional[str] = None
     prompt: Optional[str] = None
+    selected_source_table: Optional[str] = None
+    selected_target_table: Optional[str] = None
     schedule_cron: Optional[str] = None
     schedule_label: Optional[str] = None
     status: Optional[str] = None
@@ -123,27 +144,114 @@ async def catalog_harvest(req: CatalogHarvestRequest, background_tasks: Backgrou
     """
     mgr = get_metadata_manager()
     if not mgr:
-        raise HTTPException(503, "Metadata catalog not available")
+        err = get_metadata_catalog_error()
+        raise HTTPException(503, err)
     connections = conn_manager.load_connections()
     conn = next((c for c in connections if c.id == req.conn_id or c.name == req.conn_id), None)
     if not conn:
         raise HTTPException(400, f"Connection '{req.conn_id}' not found")
     conn_id = getattr(conn, "id", None) or getattr(conn, "name", "")
 
+    def _log(msg: str):
+        ts = datetime.datetime.utcnow().strftime("%H:%M:%S")
+        with _harvest_lock:
+            if conn_id not in _harvest_logs:
+                _harvest_logs[conn_id] = []
+            _harvest_logs[conn_id].append({"ts": ts, "msg": msg})
+
     def _harvest():
+        with _harvest_lock:
+            _harvest_status[conn_id] = {
+                "status": "running",
+                "started_at": datetime.datetime.utcnow().isoformat() + "Z",
+                "completed_at": None,
+                "table_count": None,
+                "error": None,
+            }
+            _harvest_logs[conn_id] = []
+            _harvest_cancel_requested.pop(conn_id, None)
         try:
+            _log("Connecting and listing tables...")
             n = mgr.harvest_connection(
                 conn,
                 conn_id,
                 schema=req.schema,
+                progress_cb=lambda m: _log(m),
+                cancel_check=lambda: _harvest_cancel_requested.get(conn_id, False),
                 run_profiler=bool(req.run_profiler),
             )
-            log.info("Catalog harvest completed for %s: %s tables", conn_id, n)
+            was_cancelled = _harvest_cancel_requested.pop(conn_id, None)
+            _log(f"Harvest {'cancelled' if was_cancelled else 'complete'}: {n} tables processed.")
+            stats = mgr.get_harvest_stats(conn_id)
+            with _harvest_lock:
+                _harvest_status[conn_id] = {
+                    "status": "cancelled" if was_cancelled else "completed",
+                    "started_at": _harvest_status.get(conn_id, {}).get("started_at"),
+                    "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "table_count": n,
+                    "columns_count": stats.get("columns_count", 0),
+                    "last_harvest_at": stats.get("last_harvest_at"),
+                    "error": None,
+                }
+            log.info("Catalog harvest %s for %s: %s tables", "cancelled" if was_cancelled else "completed", conn_id, n)
         except Exception as e:
             log.exception("Catalog harvest failed: %s", e)
+            with _harvest_lock:
+                _harvest_status[conn_id] = {
+                    "status": "failed",
+                    "started_at": _harvest_status.get(conn_id, {}).get("started_at"),
+                    "completed_at": datetime.datetime.utcnow().isoformat() + "Z",
+                    "table_count": None,
+                    "error": str(e),
+                }
 
     background_tasks.add_task(_harvest)
     return {"message": "Harvest started in background", "conn_id": conn_id}
+
+class CatalogHarvestCancelRequest(BaseModel):
+    conn_id: str
+
+@app.post("/api/catalog/harvest/cancel")
+async def catalog_harvest_cancel(req: CatalogHarvestCancelRequest):
+    """Request harvest to stop for a connection. Harvest stops between tables."""
+    with _harvest_lock:
+        _harvest_cancel_requested[req.conn_id] = True
+    return {"message": "Cancel requested", "conn_id": req.conn_id}
+
+@app.get("/api/catalog/harvest-status")
+async def catalog_harvest_status(conn_id: Optional[str] = None):
+    """Get harvest status for connection(s): completion, timestamp, volume (tables, columns)."""
+    mgr = get_metadata_manager()
+    with _harvest_lock:
+        statuses = dict(_harvest_status)
+    # Merge with catalog stats for persisted last_harvest_at and volume
+    snowflake_conns = [c.id or c.name for c in conn_manager.load_connections() if getattr(c, "dialect", "") == "SNOWFLAKE"]
+    conn_ids = list(set(([conn_id] if conn_id else []) + list(statuses.keys()) + snowflake_conns))
+    result = {}
+    for cid in conn_ids:
+        s = statuses.get(cid, {})
+        if mgr and (cid and (conn_id is None or cid == conn_id)):
+            stats = mgr.get_harvest_stats(cid)
+            with _harvest_lock:
+                logs = list(_harvest_logs.get(cid, []))
+            merged = {
+                "status": s.get("status", "idle"),
+                "started_at": s.get("started_at"),
+                "completed_at": s.get("completed_at"),
+                "table_count": s.get("table_count") if s.get("table_count") is not None else stats.get("table_count", 0),
+                "columns_count": s.get("columns_count") if s.get("columns_count") is not None else stats.get("columns_count", 0),
+                "last_harvest_at": s.get("last_harvest_at") or stats.get("last_harvest_at"),
+                "error": s.get("error"),
+                "logs": logs,
+            }
+        else:
+            with _harvest_lock:
+                logs = list(_harvest_logs.get(cid, []))
+            merged = {**s, "status": s.get("status", "idle"), "logs": logs}
+        result[cid] = merged
+    if conn_id:
+        return result.get(conn_id, {"status": "idle", "table_count": 0, "columns_count": 0, "last_harvest_at": None, "logs": []})
+    return result
 
 @app.get("/api/catalog/search")
 async def catalog_search(q: str, conn_id: Optional[str] = None, top_k: int = 10):
@@ -180,6 +288,8 @@ async def create_job(payload: JobCreate):
             source_conn_id=payload.source_conn_id,
             target_conn_id=payload.target_conn_id,
             prompt=payload.prompt,
+            selected_source_table=payload.selected_source_table or "",
+            selected_target_table=payload.selected_target_table or "",
             schedule_cron=payload.schedule_cron or "",
             schedule_label=payload.schedule_label or "",
             status=payload.status or JobStatus.ACTIVE,
@@ -275,6 +385,8 @@ class DryRunRequest(BaseModel):
     prompt: str
     user_feedback: Optional[str] = None     # feedback from previous attempt
     previous_sql: Optional[str] = None      # SQL from previous attempt to improve
+    selected_source_table: Optional[str] = None   # e.g. "CITY.CITY_RAW" when user confirms
+    selected_target_table: Optional[str] = None  # e.g. "CITY_RAW_STG" when user confirms
 
 @app.post("/api/jobs/dry-run")
 async def dry_run(req: DryRunRequest):
@@ -328,9 +440,15 @@ async def dry_run(req: DryRunRequest):
             "grounding_result": None,
             "grounded_ddl": "",
             "semantic_mappings": None,
+            "selected_source_table": req.selected_source_table,
+            "selected_target_table": req.selected_target_table,
             "special_action": "",
             "repair_attempts": 0,
             "max_repairs": 3,
+            "critique_passed": True,
+            "critique_issues": None,
+            "critique_repair_attempts": 0,
+            "max_critique_repairs": 2,
             "is_dry_run": True,
             "source_conn": src,
             "target_conn": tgt,
@@ -355,6 +473,22 @@ async def dry_run(req: DryRunRequest):
         log_lines.extend(final_state.get("logs", []))
         
         if final_state.get("is_valid_prompt", True) is False:
+            vr = final_state.get("validation_result") or {}
+            if vr.get("source_tables_to_confirm") or vr.get("target_table_suggestions"):
+                _log("⏸ Needs user interaction: confirm source and/or target table.")
+                return {
+                    "status": "needs_interaction",
+                    "phase": "intercept",
+                    "sql": None,
+                    "verified": False,
+                    "verification_details": "",
+                    "repair_attempts": 0,
+                    "logs": log_lines,
+                    "error": final_state.get("validation_error", ""),
+                    "validation_result": vr,
+                    "selected_source_table": final_state.get("selected_source_table"),
+                    "selected_target_table": final_state.get("selected_target_table"),
+                }
             _log(f"🚫 Prompt validation failed: {final_state.get('validation_error')}")
             return {
                 "status": "validation_failed",
@@ -364,7 +498,8 @@ async def dry_run(req: DryRunRequest):
                 "verification_details": "",
                 "repair_attempts": 0,
                 "logs": log_lines,
-                "error": final_state.get("validation_error", "Vague prompt. Please clarify.")
+                "error": final_state.get("validation_error", "Vague prompt. Please clarify."),
+                "validation_result": final_state.get("validation_result"),
             }
         
         status = "verified" if final_state["verified"] else ("repaired" if final_state["repair_attempts"] > 0 else "unverified")
@@ -467,11 +602,59 @@ async def list_runs(job_id: str, limit: int = 50):
 
 @app.get("/api/runs/{run_id}")
 async def get_run(run_id: str):
+    """Get run details including lineage metadata (LLM version, input DDLs, source->target map, Z3 verification)."""
     with get_db() as db:
         run = db.query(JobRun).filter(JobRun.id == run_id).first()
         if not run:
             raise HTTPException(404, "Run not found")
         return run.to_dict()
+
+
+@app.get("/api/runs/{run_id}/lineage")
+async def get_run_lineage(run_id: str):
+    """Get lineage metadata for a run: LLM version, input DDLs, source->target mapping, Z3 verification results."""
+    with get_db() as db:
+        run = db.query(JobRun).filter(JobRun.id == run_id).first()
+        if not run:
+            raise HTTPException(404, "Run not found")
+        d = run.to_dict()
+        return d.get("lineage") or {}
+
+
+@app.post("/api/runs/{run_id}/promote-to-gold")
+async def promote_run_to_gold(run_id: str):
+    """Promote a successful run's SQL to the Gold Query store for few-shot LLM prompting."""
+    with get_db() as db:
+        run = db.query(JobRun).filter(JobRun.id == run_id).first()
+        if not run:
+            raise HTTPException(404, "Run not found")
+        if run.status != RunStatus.SUCCESS:
+            raise HTTPException(400, "Only successful runs can be promoted to Gold Query store.")
+        if not run.generated_sql or not run.generated_sql.strip():
+            raise HTTPException(400, "Run has no generated SQL to promote.")
+
+        job = db.query(Job).filter(Job.id == run.job_id).first()
+        if not job:
+            raise HTTPException(404, "Job not found")
+
+        problem_description = job.prompt or ""
+        if not problem_description.strip():
+            raise HTTPException(400, "Job has no prompt to use as problem description.")
+
+        # Get dialect from target connection
+        conns = conn_manager.load_connections()
+        tgt = next((c for c in conns if c.id == job.target_conn_id or c.name == job.target_conn_id), None)
+        dialect = (tgt.dialect or "SNOWFLAKE").upper() if tgt else "SNOWFLAKE"
+
+    gq = add_gold_query(
+        problem_description=problem_description.strip(),
+        sql_query=run.generated_sql.strip(),
+        dialect=dialect,
+    )
+    if not gq:
+        raise HTTPException(500, "Failed to add Gold Query.")
+    return {"status": "ok", "gold_query": gq}
+
 
 @app.get("/api/runs/{run_id}/logs")
 async def stream_logs(run_id: str):

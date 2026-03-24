@@ -166,6 +166,7 @@ def execute_run(job_id: str, run_id: str, triggered_by: str = "manual"):
     rows = 0
     error = ""
     verified = False
+    lineage_data = {}
 
     try:
         print(f"DEBUG(execute_run): Entering try block for {run_id}")
@@ -178,6 +179,8 @@ def execute_run(job_id: str, run_id: str, triggered_by: str = "manual"):
             prompt = job.prompt
             src_id = job.source_conn_id
             tgt_id = job.target_conn_id
+            selected_source_table = getattr(job, "selected_source_table", None) or ""
+            selected_target_table = getattr(job, "selected_target_table", None) or ""
 
         print(f"DEBUG(execute_run): Fetched job details. src: {src_id}, tgt: {tgt_id}")
         _log(f"Starting job '{job_id}' | triggered_by={triggered_by}")
@@ -230,6 +233,13 @@ def main():
         strat = ETLStrategy(data['strategy'])
         model = os.getenv("LITELLM_MODEL", "gemini/gemini-2.5-flash")
         
+        metadata_manager = None
+        try:
+            from integritycore.metadata.manager import MetadataManager
+            metadata_manager = MetadataManager()
+        except Exception:
+            pass
+        
         executor = DatabaseExecutor()
         graph = build_etl_graph()
         
@@ -246,13 +256,20 @@ def main():
             "is_valid_prompt": True,
             "validation_error": "",
             "validation_result": None,
-            "metadata_manager": None,
+            "metadata_manager": metadata_manager,
             "grounding_result": None,
             "grounded_ddl": "",
+            "schema_ddl_used": "",
             "semantic_mappings": None,
+            "selected_source_table": data.get("selected_source_table") or None,
+            "selected_target_table": data.get("selected_target_table") or None,
             "special_action": "",
             "repair_attempts": 0,
             "max_repairs": 3,
+            "critique_passed": True,
+            "critique_issues": None,
+            "critique_repair_attempts": 0,
+            "max_critique_repairs": 2,
             "is_dry_run": False,
             "source_conn": src,
             "target_conn": tgt,
@@ -263,12 +280,28 @@ def main():
         final_state = graph.invoke(state_input)
         
         res = final_state.get("execution_result")
+        model_name = final_state.get("model_name", os.getenv("LITELLM_MODEL", "gemini/gemini-2.5-flash"))
+        input_ddl = final_state.get("schema_ddl_used") or final_state.get("grounded_ddl", "")
+        source_tbl = final_state.get("selected_source_table") or data.get("selected_source_table") or ""
+        target_tbl = final_state.get("selected_target_table") or data.get("selected_target_table") or ""
+        source_target_map = {{source_tbl: target_tbl}} if source_tbl and target_tbl else {{}}
+        logic_verification = {{
+            "verified": final_state.get("verified", False),
+            "verification_details": final_state.get("verification_details", ""),
+        }}
+        
+        lineage = {{
+            "llm_model_version": model_name,
+            "input_ddl_context": input_ddl,
+            "source_target_map": source_target_map,
+            "logic_verification": logic_verification,
+        }}
         
         if res and res.success:
-            print("SUCCESS_RUN===" + json.dumps({{"sql": final_state["sql"], "rows": res.rows_affected, "logs": final_state["logs"]}}))
+            print("SUCCESS_RUN===" + json.dumps({{"sql": final_state["sql"], "rows": res.rows_affected, "logs": final_state["logs"], "lineage": lineage}}))
         else:
             err = res.error if res else final_state.get("verification_details", "Unknown failure")
-            print("FAILED_RUN===" + json.dumps({{"error": getattr(err, "message", str(err)), "sql": final_state.get("sql", ""), "logs": final_state.get("logs", [])}}))
+            print("FAILED_RUN===" + json.dumps({{"error": getattr(err, "message", str(err)), "sql": final_state.get("sql", ""), "logs": final_state.get("logs", []), "lineage": lineage}}))
             
     except Exception as e:
         import traceback
@@ -291,14 +324,20 @@ if __name__ == '__main__':
                 "src_id": src_id,
                 "tgt_id": tgt_id,
                 "source": src.dialect,
-                "target": tgt.dialect
+                "target": tgt.dialect,
+                "selected_source_table": selected_source_table or "",
+                "selected_target_table": selected_target_table or "",
             })
             
+            # stdin=DEVNULL: avoids "init_sys_streams: Bad file descriptor" when the parent
+            # (uvicorn/worker) has closed or invalid stdio FDs inherited by the child Python.
             proc = subprocess.run(
                 [sys.executable, script_path, payload],
+                stdin=subprocess.DEVNULL,
                 capture_output=True,
                 text=True,
-                env=os.environ.copy()
+                env=os.environ.copy(),
+                start_new_session=True,
             )
             
             if proc.returncode != 0:
@@ -311,6 +350,7 @@ if __name__ == '__main__':
                 sql_out = data["sql"]
                 rows = data["rows"]
                 log_lines.extend(data["logs"])
+                lineage_data = data.get("lineage", {})
                 verified = True
                 status = RunStatus.SUCCESS
                 _log(f"✅ Job completed successfully.")
@@ -320,6 +360,7 @@ if __name__ == '__main__':
                 sql_out = data.get("sql", "")
                 error = data.get("error", "Unknown failure")
                 log_lines.extend(data.get("logs", []))
+                lineage_data = data.get("lineage", {})
                 status = RunStatus.FAILED
                 _log(f"❌ Job execution failed: {error}")
             else:
@@ -352,3 +393,9 @@ if __name__ == '__main__':
                 run.generated_sql = sql_out
                 run.rows_processed = rows
                 run.verified = verified
+                # Lineage metadata
+                if lineage_data:
+                    run.llm_model_version = lineage_data.get("llm_model_version", "") or ""
+                    run.input_ddl_context = lineage_data.get("input_ddl_context", "") or ""
+                    run.source_target_map = json.dumps(lineage_data.get("source_target_map", {}))
+                    run.logic_verification_result = json.dumps(lineage_data.get("logic_verification", {}))

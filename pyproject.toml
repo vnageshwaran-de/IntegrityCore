@@ -10,6 +10,7 @@ readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 dependencies = [
+    "python-dotenv",
     "z3-solver",
     "google-adk",
     "litellm",
@@ -20,6 +21,7 @@ dependencies = [
     "duckdb",
     "lancedb",
     "pyarrow",
+    "snowflake-connector-python",
 ]
 
 [project.scripts]

@@ -186,91 +186,147 @@ class SnowflakeIntrospector(BaseIntrospector):
         schema: Optional[str] = None,
         table: Optional[str] = None,
     ) -> List[ConstraintMetadata]:
-        """Primary and foreign key constraints for relational graph."""
+        """Primary and foreign key constraints for relational graph.
+        Uses TABLE_CONSTRAINTS + REFERENTIAL_CONSTRAINTS per Snowflake Information Schema.
+        Snowflake does not have KEY_COLUMN_USAGE; column names from SHOW PRIMARY KEYS / SHOW IMPORTED KEYS.
+        """
         cur = self._cursor()
         try:
             constraints = []
             if not schema:
                 return constraints
-            # Snowflake: constraint info from information_schema
+            db = database or (self.conn.database if hasattr(self.conn, "database") else None)
+            # Use TABLE_CONSTRAINTS only (no KEY_COLUMN_USAGE - not in Snowflake per docs)
+            # per https://www.snowflake.com/en/blog/using-snowflake-information-schema/
+            qual = f'"{db}".information_schema.table_constraints' if db else "information_schema.table_constraints"
             cur.execute(
-                """
-                SELECT tc.constraint_name, tc.constraint_type, tc.table_schema, tc.table_name,
-                       kcu.column_name
-                FROM information_schema.table_constraints tc
-                JOIN information_schema.key_column_usage kcu
-                  ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema
-                  AND tc.table_name = kcu.table_name
-                WHERE tc.table_schema = %s AND tc.constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')
-                """ + (" AND tc.table_name = %s" if table else "") + " ORDER BY tc.constraint_name, kcu.ordinal_position",
+                f"""
+                SELECT constraint_name, constraint_type, table_schema, table_name
+                FROM {qual}
+                WHERE table_schema = %s AND constraint_type IN ('PRIMARY KEY', 'FOREIGN KEY')
+                """ + (" AND table_name = %s" if table else "") + " ORDER BY constraint_name",
                 (schema, table) if table else (schema,),
             )
             rows = cur.fetchall()
-            # Group by constraint
-            by_key: dict = {}
+            # Build table qualifier for SHOW commands
+            tbl_qual = f'"{db}"."{schema}"."{table}"' if db and table else (f'"{schema}"."{table}"' if table else None)
+            pk_cols = self._get_pk_columns(cur, db, schema, table, tbl_qual)
+            fk_cols = self._get_fk_columns(cur, db, schema, table, tbl_qual)
             for r in rows:
-                cname, ctype, sch, tbl, col = r[0], r[1], r[2], r[3], r[4]
-                key = (cname, sch, tbl)
-                if key not in by_key:
-                    by_key[key] = {"type": ctype, "cols": [], "ref": None}
-                by_key[key]["cols"].append(col)
-
-            for (cname, sch, tbl), v in by_key.items():
+                cname, ctype, sch, tbl = r[0], r[1], r[2], r[3]
                 if table and tbl != table:
                     continue
-                ct = ConstraintType.PRIMARY_KEY if v["type"] == "PRIMARY KEY" else ConstraintType.FOREIGN_KEY
+                ct = ConstraintType.PRIMARY_KEY if ctype == "PRIMARY KEY" else ConstraintType.FOREIGN_KEY
+                cols = pk_cols.get((cname, sch, tbl), []) if ct == ConstraintType.PRIMARY_KEY else fk_cols.get((cname, sch, tbl), [])
                 ref_schema, ref_table, ref_cols = None, None, None
                 if ct == ConstraintType.FOREIGN_KEY:
-                    ref_schema, ref_table, ref_cols = self._get_fk_reference(cur, schema, tbl, cname)
+                    ref_schema, ref_table, ref_cols = self._get_fk_reference(cur, db, schema, tbl, cname)
                 constraints.append(
                     ConstraintMetadata(
                         constraint_name=cname,
                         constraint_type=ct,
                         table_schema=sch,
                         table_name=tbl,
-                        column_names=v["cols"],
+                        column_names=cols,
                         ref_table_schema=ref_schema,
                         ref_table_name=ref_table,
                         ref_column_names=ref_cols,
                     )
                 )
             return constraints
+        except Exception as e:
+            log.debug("get_constraints failed (returning empty): %s", e)
+            return []
         finally:
             try:
                 cur.close()
             except Exception:
                 pass
 
+    def _get_pk_columns(
+        self, cur, database: Optional[str], schema: str, table: Optional[str], tbl_qual: Optional[str]
+    ) -> dict:
+        """Get PK column names via SHOW PRIMARY KEYS (Snowflake has no KEY_COLUMN_USAGE)."""
+        out: dict = {}
+        try:
+            if tbl_qual:
+                cur.execute(f"SHOW PRIMARY KEYS IN TABLE {tbl_qual}")
+            elif database and schema:
+                cur.execute(f'SHOW PRIMARY KEYS IN SCHEMA "{database}"."{schema}"')
+            else:
+                return out
+            desc = [d[0].lower() for d in (cur.description or [])]
+            for row in cur.fetchall():
+                r = dict(zip(desc, row)) if desc else {}
+                cname, col = r.get("constraint_name"), r.get("column_name")
+                sch = r.get("schema_name") or schema
+                tbl = r.get("table_name") or table
+                seq = r.get("key_sequence") or 0
+                if cname and col and sch and tbl:
+                    key = (cname, sch, tbl)
+                    if key not in out:
+                        out[key] = []
+                    out[key].append((int(seq) if seq is not None else 0, col))
+            for k in list(out.keys()):
+                out[k] = [c for _, c in sorted(out[k], key=lambda x: x[0])]
+        except Exception:
+            pass
+        return out
+
+    def _get_fk_columns(
+        self, cur, database: Optional[str], schema: str, table: Optional[str], tbl_qual: Optional[str]
+    ) -> dict:
+        """Get FK column names via SHOW IMPORTED KEYS."""
+        out: dict = {}
+        try:
+            if tbl_qual:
+                cur.execute(f"SHOW IMPORTED KEYS IN TABLE {tbl_qual}")
+            elif database and schema:
+                cur.execute(f'SHOW IMPORTED KEYS IN SCHEMA "{database}"."{schema}"')
+            else:
+                return out
+            desc = [d[0].lower() for d in (cur.description or [])]
+            for row in cur.fetchall():
+                r = dict(zip(desc, row)) if desc else {}
+                cname = r.get("constraint_name")
+                col = r.get("column_name") or r.get("fk_column_name")
+                sch = r.get("schema_name") or (r.get("fk_schema_name") if "fk_schema_name" in r else schema)
+                tbl = r.get("table_name") or (r.get("fk_table_name") if "fk_table_name" in r else table)
+                if cname and col and sch and tbl:
+                    key = (cname, sch, tbl)
+                    if key not in out:
+                        out[key] = []
+                    out[key].append(col)
+        except Exception:
+            pass
+        return out
+
     def _get_fk_reference(
         self,
         cur,
+        database: Optional[str],
         schema: str,
         table: str,
         constraint_name: str,
     ) -> tuple:
+        """Snowflake: REFERENTIAL_CONSTRAINTS + TABLE_CONSTRAINTS for ref table (no KEY_COLUMN_USAGE)."""
         try:
+            qual = f'"{database}".information_schema' if database else "information_schema"
             cur.execute(
-                """
-                SELECT referenced_table_schema, referenced_table_name
-                FROM information_schema.referential_constraints
-                WHERE constraint_schema = %s AND constraint_name = %s
+                f"""
+                SELECT rc.unique_constraint_schema, tc.table_name
+                FROM {qual}.referential_constraints rc
+                JOIN {qual}.table_constraints tc
+                  ON tc.constraint_name = rc.unique_constraint_name
+                  AND tc.constraint_schema = rc.unique_constraint_schema
+                WHERE rc.constraint_schema = %s AND rc.constraint_name = %s
                 """,
                 (schema, constraint_name),
             )
             row = cur.fetchone()
             if not row:
                 return None, None, None
-            ref_schema, ref_table = row[0], row[1]
-            cur.execute(
-                """
-                SELECT referenced_column_name FROM information_schema.key_column_usage
-                WHERE constraint_schema = %s AND constraint_name = %s
-                ORDER BY ordinal_position
-                """,
-                (schema, constraint_name),
-            )
-            ref_cols = [r[0] for r in cur.fetchall() if r[0]]
-            return ref_schema, ref_table, ref_cols
+            return row[0], row[1], None  # ref_cols not available without KEY_COLUMN_USAGE
         except Exception:
             return None, None, None
 

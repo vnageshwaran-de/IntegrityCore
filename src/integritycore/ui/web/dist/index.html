@@ -413,7 +413,9 @@
                 source_conn_id: editJob.source_conn_id, target_conn_id: editJob.target_conn_id,
                 prompt: editJob.prompt, schedule_cron: editJob.schedule_cron || '',
                 schedule_label: editJob.schedule_label || '',
-            } : { name: '', description: '', source_conn_id: '', target_conn_id: '', prompt: '', schedule_cron: '', schedule_label: '' };
+                selected_source_table: editJob.selected_source_table || '',
+                selected_target_table: editJob.selected_target_table || '',
+            } : { name: '', description: '', source_conn_id: '', target_conn_id: '', prompt: '', schedule_cron: '', schedule_label: '', selected_source_table: '', selected_target_table: '' };
             const [form, setForm] = useState(init);
             const [customCron, setCustomCron] = useState(false);
             const [saving, setSaving] = useState(false);
@@ -433,6 +435,8 @@
             const [userFeedback, setUserFeedback] = useState('');
             const [iteration, setIteration] = useState(0);
             const logRef = useRef(null);
+            const logsRef = useRef(null);
+            const [activeTab, setActiveTab] = useState('chat'); // 'chat' | 'logs'
 
             const CRON_PRESETS = [
                 { label: 'Manual only', value: '' },
@@ -453,9 +457,8 @@
             };
 
             // Run the LLM dry-run
-            const runDryRun = async (feedback, prevSQL) => {
+            const runDryRun = async (feedback, prevSQL, overrideSourceTable = null, overrideTargetTable = null) => {
                 setDryStatus('running');
-                setDryLogs([]);
                 setDrySQL('');
                 setDryVerified(false);
                 setDryError('');
@@ -470,6 +473,14 @@
                     payload.user_feedback = feedback;
                     payload.previous_sql = prevSQL;
                 }
+                const srcTable = overrideSourceTable ?? form.selected_source_table;
+                if (srcTable) {
+                    payload.selected_source_table = srcTable;
+                }
+                const tgtTable = overrideTargetTable ?? form.selected_target_table;
+                if (tgtTable) {
+                    payload.selected_target_table = tgtTable;
+                }
 
                 try {
                     const r = await API('/api/jobs/dry-run', {
@@ -483,6 +494,8 @@
                     setDryRepairs(r.repair_attempts || 0);
                     setDryStatus(r);
                     setIteration(i => i + 1);
+                    if (r.selected_source_table) setForm(f => ({ ...f, selected_source_table: r.selected_source_table }));
+                    if (r.selected_target_table) setForm(f => ({ ...f, selected_target_table: r.selected_target_table }));
 
                     // Add to chat history
                     setChatHistory(h => [...h, {
@@ -492,6 +505,7 @@
                         verified: r.verified,
                         status: r.status,
                         error: r.error,
+                        validation_result: r.validation_result,
                         repairs: r.repair_attempts,
                         logs: r.logs,
                         feedback: feedback || null,
@@ -513,7 +527,33 @@
                 setChatHistory(h => [...h, { type: 'user', text: fb }]);
                 setUserFeedback('');
                 setStep('dryrun');
-                runDryRun(fb, drySQL);
+                // If last result was no_catalog_match and feedback looks like table spec(s), use as selected_source_table (and optionally target)
+                const lastResult = [...(chatHistory || [])].reverse().find(m => m.type === 'result');
+                const wasNoCatalog = lastResult?.status === 'validation_failed' && lastResult?.validation_result?.no_catalog_match;
+                const tableSpec = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)+$/;
+                const trimmed = fb.trim();
+                const tbl = '[a-zA-Z0-9_]+(\\.[a-zA-Z0-9_]+)+';
+                let overrideSrc = null, overrideTgt = null;
+                if (wasNoCatalog) {
+                    const toMatch = trimmed.match(new RegExp(`^(${tbl})\\s+(?:TO|INTO)\\s+(${tbl})$`, 'i'));
+                    const srcTgtMatch = trimmed.match(new RegExp(`Source:\\s*(${tbl})`, 'i'));
+                    const tgtMatch = trimmed.match(new RegExp(`Target:\\s*(${tbl})`, 'i'));
+                    if (toMatch) {
+                        overrideSrc = toMatch[1].trim();
+                        overrideTgt = toMatch[3].trim();
+                    } else if (srcTgtMatch || tgtMatch) {
+                        overrideSrc = srcTgtMatch ? srcTgtMatch[1].trim() : null;
+                        overrideTgt = tgtMatch ? tgtMatch[1].trim() : null;
+                    } else if (tableSpec.test(trimmed)) {
+                        overrideSrc = trimmed;
+                    }
+                }
+                if (overrideSrc) {
+                    setForm(f => ({ ...f, selected_source_table: overrideSrc, ...(overrideTgt && { selected_target_table: overrideTgt }) }));
+                    runDryRun(null, null, overrideSrc, overrideTgt);
+                } else {
+                    runDryRun(fb, drySQL);
+                }
             };
 
             // Handle missing schema auto-generation acceptance
@@ -549,6 +589,7 @@
 
             useEffect(() => {
                 if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+                if (logsRef.current) logsRef.current.scrollTop = logsRef.current.scrollHeight;
             }, [dryLogs, chatHistory]);
 
             return (
@@ -621,27 +662,45 @@
 
                             {/* ── Step 2: Dry Run in progress ─────────────────── */}
                             {step === 'dryrun' && (
-                                <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '16px', alignItems: 'center', justifyContent: 'center', minHeight: '300px' }}>
-                                    <div style={{ width: '60px', height: '60px', border: '3px solid rgba(99,102,241,0.3)', borderTop: '3px solid #6366f1', borderRadius: '50%' }} className="spin" />
-                                    <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#e2e8f0' }}>
-                                        {iteration === 0 ? '🧠 LLM Generating ETL SQL…' : `🔧 Applying Feedback (Iteration ${iteration + 1})…`}
-                                    </h3>
-                                    <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: '#94a3b8' }}>
-                                        <span>Generate SQL</span> <span>→</span>
-                                        <span>SMT Verify</span> <span>→</span>
-                                        <span>Self-Heal</span>
+                                <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '0', minHeight: '300px' }}>
+                                    <div style={{ display: 'flex', gap: '4px', borderBottom: '1px solid rgba(99,102,241,0.2)', marginBottom: '12px' }}>
+                                        <button onClick={() => setActiveTab('chat')} style={{ padding: '10px 16px', fontSize: '13px', fontWeight: 600, background: activeTab === 'chat' ? 'rgba(99,102,241,0.2)' : 'transparent', color: activeTab === 'chat' ? '#a5b4fc' : '#64748b', border: 'none', borderBottom: activeTab === 'chat' ? '2px solid #6366f1' : '2px solid transparent', cursor: 'pointer', borderRadius: '6px 6px 0 0' }}>Status</button>
+                                        <button onClick={() => setActiveTab('logs')} style={{ padding: '10px 16px', fontSize: '13px', fontWeight: 600, background: activeTab === 'logs' ? 'rgba(99,102,241,0.2)' : 'transparent', color: activeTab === 'logs' ? '#a5b4fc' : '#64748b', border: 'none', borderBottom: activeTab === 'logs' ? '2px solid #6366f1' : '2px solid transparent', cursor: 'pointer', borderRadius: '6px 6px 0 0' }}>📋 Logs</button>
                                     </div>
-                                    <p style={{ fontSize: '12px', color: '#64748b', maxWidth: '400px', textAlign: 'center' }}>
-                                        The LLM is generating SQL, verifying it with Z3 SMT solver, and auto-repairing if needed.
-                                        This may take 10-30 seconds.
-                                    </p>
+                                    {activeTab === 'chat' ? (
+                                        <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '16px', flex: 1 }}>
+                                            <div style={{ width: '60px', height: '60px', border: '3px solid rgba(99,102,241,0.3)', borderTop: '3px solid #6366f1', borderRadius: '50%' }} className="spin" />
+                                            <h3 style={{ fontSize: '18px', fontWeight: 700, color: '#e2e8f0' }}>
+                                                {iteration === 0 ? '🧠 LLM Generating ETL SQL…' : `🔧 Applying Feedback (Iteration ${iteration + 1})…`}
+                                            </h3>
+                                            <div style={{ display: 'flex', gap: '16px', fontSize: '12px', color: '#94a3b8' }}>
+                                                <span>Generate SQL</span> <span>→</span>
+                                                <span>SMT Verify</span> <span>→</span>
+                                                <span>Self-Heal</span>
+                                            </div>
+                                            <p style={{ fontSize: '12px', color: '#64748b', maxWidth: '400px', textAlign: 'center' }}>
+                                                The LLM is generating SQL, verifying it with Z3 SMT solver, and auto-repairing if needed.
+                                                This may take 10-30 seconds.
+                                            </p>
+                                        </div>
+                                    ) : (
+                                        <div style={{ background: 'rgba(15,23,42,0.9)', border: '1px solid rgba(99,102,241,0.25)', borderRadius: '10px', padding: '12px', flex: 1, minHeight: '220px', display: 'flex', flexDirection: 'column' }}>
+                                            <pre ref={logsRef} className="log-box" style={{ flex: 1, margin: 0, fontSize: '11px', color: '#94a3b8', overflow: 'auto', lineHeight: 1.5 }}>
+                                                {dryLogs && dryLogs.length > 0 ? dryLogs.join('\n') : 'Waiting for run to complete… logs will appear here.'}
+                                            </pre>
+                                        </div>
+                                    )}
                                 </div>
                             )}
 
                             {/* ── Step 3: Review & Iterate ────────────────────── */}
                             {step === 'review' && (
-                                <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
-                                    {/* Chat-style conversation history */}
+                                <div className="fade-in" style={{ display: 'flex', flexDirection: 'column', gap: '0' }}>
+                                    <div style={{ display: 'flex', gap: '4px', borderBottom: '1px solid rgba(99,102,241,0.2)', marginBottom: '12px' }}>
+                                        <button onClick={() => setActiveTab('chat')} style={{ padding: '10px 16px', fontSize: '13px', fontWeight: 600, background: activeTab === 'chat' ? 'rgba(99,102,241,0.2)' : 'transparent', color: activeTab === 'chat' ? '#a5b4fc' : '#64748b', border: 'none', borderBottom: activeTab === 'chat' ? '2px solid #6366f1' : '2px solid transparent', cursor: 'pointer', borderRadius: '6px 6px 0 0' }}>Chat</button>
+                                        <button onClick={() => setActiveTab('logs')} style={{ padding: '10px 16px', fontSize: '13px', fontWeight: 600, background: activeTab === 'logs' ? 'rgba(99,102,241,0.2)' : 'transparent', color: activeTab === 'logs' ? '#a5b4fc' : '#64748b', border: 'none', borderBottom: activeTab === 'logs' ? '2px solid #6366f1' : '2px solid transparent', cursor: 'pointer', borderRadius: '6px 6px 0 0' }}>📋 Logs</button>
+                                    </div>
+                                    {activeTab === 'chat' ? (
                                     <div ref={logRef} style={{ display: 'flex', flexDirection: 'column', gap: '12px', maxHeight: '50vh', overflowY: 'auto', padding: '4px' }}>
                                         {chatHistory.map((msg, i) => (
                                             <div key={i} style={{
@@ -690,6 +749,45 @@
                                                                     </button>
                                                                 </div>
                                                             </div>
+                                                        ) : msg.status === 'needs_interaction' ? (
+                                                            <div style={{ background: 'rgba(99,102,241,0.1)', border: '1px solid rgba(99,102,241,0.3)', borderRadius: '8px', padding: '16px', display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                                                                <div style={{ fontSize: '13px', fontWeight: 700, color: '#a5b4fc' }}>🔍 Confirm your selection</div>
+                                                                {msg.validation_result?.source_tables_to_confirm?.length > 0 && (
+                                                                    <div>
+                                                                        <div style={{ fontSize: '12px', color: '#c7d2fe', marginBottom: '8px' }}>{msg.validation_result.message || 'I found these tables. Which source table do you want?'}</div>
+                                                                        <select className="input" value={form.selected_source_table || ''} onChange={e => setForm(f => ({ ...f, selected_source_table: e.target.value || '' }))}
+                                                                            style={{ maxWidth: '320px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer' }}>
+                                                                            <option value="">— Select source table —</option>
+                                                                            {(msg.validation_result.source_tables_to_confirm || []).map(t => (
+                                                                                <option key={t} value={t}>📋 {t}</option>
+                                                                            ))}
+                                                                        </select>
+                                                                    </div>
+                                                                )}
+                                                                {msg.validation_result?.target_table_suggestions?.length > 0 && (
+                                                                    <div>
+                                                                        <div style={{ fontSize: '12px', color: '#c7d2fe', marginBottom: '8px' }}>{msg.validation_result.target_message || msg.validation_result.message || "You didn't specify the target table. Suggested names:"}</div>
+                                                                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center', flexWrap: 'wrap' }}>
+                                                                            <select className="input" value={form.selected_target_table || ''} onChange={e => setForm(f => ({ ...f, selected_target_table: e.target.value || '' }))}
+                                                                                style={{ maxWidth: '280px', padding: '8px 12px', fontSize: '12px', cursor: 'pointer' }}>
+                                                                                <option value="">— Select target table —</option>
+                                                                                {(msg.validation_result.target_table_suggestions || []).map(t => (
+                                                                                    <option key={t} value={t}>📥 {t}</option>
+                                                                                ))}
+                                                                            </select>
+                                                                            <span style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+                                                                                <input id="customTargetInput" className="input" placeholder="Or type custom name" style={{ width: '140px', padding: '6px 10px', fontSize: '11px' }}
+                                                                                    onKeyDown={e => { if (e.key === 'Enter') { const v = e.target.value.trim(); if (v) { setForm(f => ({ ...f, selected_target_table: v })); setStep('dryrun'); runDryRun(null, null); } } }} />
+                                                                                <button className="btn btn-ghost btn-sm" style={{ fontSize: '10px' }} onClick={() => { const v = document.getElementById('customTargetInput')?.value?.trim(); if (v) { setForm(f => ({ ...f, selected_target_table: v })); setStep('dryrun'); runDryRun(null, null); } }}>Use</button>
+                                                                            </span>
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                                <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }} onClick={() => { setStep('dryrun'); runDryRun(null, null); }}
+                                                                    disabled={(msg.validation_result?.source_tables_to_confirm?.length > 0 && !form.selected_source_table) || (msg.validation_result?.target_table_suggestions?.length > 0 && !form.selected_target_table)}>
+                                                                    Apply & Run
+                                                                </button>
+                                                            </div>
                                                         ) : msg.status === 'validation_failed' ? (
                                                             <div style={{ background: 'rgba(239,68,68,0.1)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: '8px', padding: '10px 14px', display: 'flex', alignItems: 'center', gap: '8px' }}>
                                                                 <span style={{ fontSize: '18px' }}>🚫</span>
@@ -713,18 +811,16 @@
                                                                 <div style={{ fontSize: '11px', color: '#fde68a', marginTop: '4px' }}>You can provide feedback below to help the LLM fix the SQL</div>
                                                             </div>
                                                         ) : null}
-                                                        {/* Execution logs (collapsible) */}
-                                                        {msg.logs && msg.logs.length > 0 && (
-                                                            <details style={{ marginTop: '8px' }}>
-                                                                <summary style={{ fontSize: '11px', color: '#64748b', cursor: 'pointer' }}>📋 Execution logs ({msg.logs.length} lines)</summary>
-                                                                <pre className="log-box" style={{ marginTop: '6px', maxHeight: '120px', fontSize: '10px' }}>{msg.logs.join('\n')}</pre>
-                                                            </details>
-                                                        )}
                                                     </div>
                                                 )}
                                             </div>
                                         ))}
                                     </div>
+                                    ) : (
+                                    <div style={{ background: 'rgba(15,23,42,0.95)', border: '1px solid rgba(99,102,241,0.3)', borderRadius: '10px', padding: '14px', flex: 1, minHeight: '300px', display: 'flex', flexDirection: 'column' }}>
+                                        <pre ref={logsRef} className="log-box" style={{ flex: 1, margin: 0, fontSize: '11px', color: '#94a3b8', overflow: 'auto', lineHeight: 1.5 }}>{dryLogs && dryLogs.length > 0 ? dryLogs.join('\n') : '(no logs yet)'}</pre>
+                                    </div>
+                                    )}
 
                                     {/* User feedback input — chat style */}
                                     <div style={{ borderTop: '1px solid rgba(99,102,241,0.2)', paddingTop: '16px' }}>
@@ -849,6 +945,23 @@
                                                 <p className="label" style={{ marginBottom: '6px' }}>Generated SQL</p>
                                                 <pre className="log-box" style={{ maxHeight: '120px', color: '#a5b4fc' }}>{selRun.generated_sql}</pre>
                                             </div>
+                                        )}
+                                        {selRun.lineage && (
+                                            <details style={{ background: 'rgba(99,102,241,0.08)', border: '1px solid rgba(99,102,241,0.2)', borderRadius: '8px', padding: '12px' }}>
+                                                <summary style={{ fontSize: '12px', fontWeight: 600, color: '#a5b4fc', cursor: 'pointer' }}>📊 Lineage & Audit</summary>
+                                                <div style={{ marginTop: '10px', fontSize: '11px', color: '#94a3b8' }}>
+                                                    {selRun.lineage.llm_model_version && <div style={{ marginBottom: '6px' }}><strong>LLM:</strong> {selRun.lineage.llm_model_version}</div>}
+                                                    {selRun.lineage.source_target_map && Object.keys(selRun.lineage.source_target_map).length > 0 && (
+                                                        <div style={{ marginBottom: '6px' }}><strong>Source → Target:</strong> {Object.entries(selRun.lineage.source_target_map).map(([s,t]) => s + ' → ' + t).join(', ')}</div>
+                                                    )}
+                                                    {selRun.lineage.logic_verification && (
+                                                        <div style={{ marginBottom: '6px' }}><strong>Z3 Verification:</strong> {selRun.lineage.logic_verification.verified ? '✅ Passed' : '⚠️ ' + (selRun.lineage.logic_verification.verification_details || 'Not passed')}</div>
+                                                    )}
+                                                    {selRun.lineage.input_ddl_context && (
+                                                        <details style={{ marginTop: '6px' }}><summary style={{ cursor: 'pointer' }}>Input DDL Context</summary><pre style={{ maxHeight: '100px', overflow: 'auto', fontSize: '10px', marginTop: '4px' }}>{selRun.lineage.input_ddl_context}</pre></details>
+                                                    )}
+                                                </div>
+                                            </details>
                                         )}
                                         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
                                             <p className="label" style={{ marginBottom: '6px' }}>
@@ -1154,10 +1267,15 @@
             const [editId, setEditId] = useState(null);
             const [testResult, setTestResult] = useState({});
             const [testing, setTesting] = useState({});
+            const [harvesting, setHarvesting] = useState({});
+            const [harvestMsg, setHarvestMsg] = useState({});
+            const [harvestStatus, setHarvestStatus] = useState({});
             const [deleteConfirmConn, setDeleteConfirmConn] = useState(null);
 
-            const load = () => API('/api/connections').then(setConns).catch(() => { });
+            const load = () => API('/api/connections').then(c => { setConns(c); if (c.some(x => x.dialect === 'SNOWFLAKE')) loadHarvestStatus(); }).catch(() => { });
+            const loadHarvestStatus = () => API('/api/catalog/harvest-status').then(setHarvestStatus).catch(() => {});
             useEffect(() => { load(); }, []);
+            useEffect(() => { if (conns.some(c => c.dialect === 'SNOWFLAKE')) loadHarvestStatus(); }, [conns]);
             const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
 
             const save = async () => {
@@ -1173,6 +1291,48 @@
                 const r = await API('/api/connections/test', { method: 'POST', body: JSON.stringify(c) }).catch(e => ({ status: 'error', logs: [e.message] }));
                 setTestResult(p => ({ ...p, [c.id || c.name]: r }));
                 setTesting(p => ({ ...p, [c.id || c.name]: false }));
+            };
+
+            const harvestConn = async (c) => {
+                const key = c.id || c.name;
+                if (c.dialect !== 'SNOWFLAKE') { setHarvestMsg(p => ({ ...p, [key]: 'Harvest only supports Snowflake' })); return; }
+                setHarvesting(p => ({ ...p, [key]: true }));
+                setHarvestMsg(p => ({ ...p, [key]: '' }));
+                try {
+                    await API('/api/catalog/harvest', { method: 'POST', body: JSON.stringify({ conn_id: key, run_profiler: true }) });
+                    setHarvestMsg(p => ({ ...p, [key]: 'Harvest in progress…' }));
+                    setHarvestStatus(s => ({ ...s, [key]: { ...s[key], status: 'running' } }));
+                    const poll = async () => {
+                        const st = await API(`/api/catalog/harvest-status?conn_id=${encodeURIComponent(key)}`);
+                        setHarvestStatus(s => ({ ...s, [key]: st }));
+                        if (st.status === 'running') setTimeout(poll, 1000);
+                        else {
+                            setHarvesting(p => ({ ...p, [key]: false }));
+                            const tc = st.table_count ?? 0, cc = st.columns_count ?? 0;
+                            const ts = st.last_harvest_at ? new Date(st.last_harvest_at).toLocaleString() : '';
+                            setHarvestMsg(p => ({ ...p, [key]: st.status === 'completed'
+                                ? (tc === 0 && cc === 0
+                                    ? 'Harvest complete • No tables found. Check database/schema or grants.'
+                                    : `Harvest complete • ${tc} tables, ${cc} columns${ts ? ' • ' + ts : ''}`)
+                                : st.status === 'cancelled' ? `Harvest stopped • ${tc} tables processed before cancel.`
+                                : st.status === 'failed' ? 'Harvest failed: ' + (st.error || 'Unknown error') : '' }));
+                        }
+                    };
+                    setTimeout(poll, 1000);
+                } catch (e) {
+                    setHarvestMsg(p => ({ ...p, [key]: 'Error: ' + (e.message || e) }));
+                    setHarvesting(p => ({ ...p, [key]: false }));
+                }
+            };
+
+            const stopHarvest = async (c) => {
+                const key = c.id || c.name;
+                try {
+                    await API('/api/catalog/harvest/cancel', { method: 'POST', body: JSON.stringify({ conn_id: key }) });
+                    setHarvestMsg(p => ({ ...p, [key]: 'Stopping harvest…' }));
+                } catch (e) {
+                    setHarvestMsg(p => ({ ...p, [key]: 'Error stopping: ' + (e.message || e) }));
+                }
             };
 
             const confirmDel = (id) => setDeleteConfirmConn(id);
@@ -1239,17 +1399,49 @@
                                             <td><span className="badge badge-blue">{c.dialect}</span></td>
                                             <td className="mono text-xs text-slate-400">{c.account || c.host || ''} {c.database ? `/ ${c.database}` : ''}</td>
                                             <td>
-                                                <div className="flex gap-2">
+                                                <div className="flex gap-2 flex-wrap">
                                                     <button className="btn btn-ghost btn-sm" disabled={!!testing[c.id || c.name]} onClick={() => testConn(c)}>{testing[c.id || c.name] ? <span className="spin">⟳</span> : '🔍'} Test</button>
+                                                    {c.dialect === 'SNOWFLAKE' && (
+                                                        <>
+                                                            <button className="btn btn-success btn-sm" disabled={!!harvesting[c.id || c.name]} onClick={() => harvestConn(c)} title="Harvest metadata for semantic catalog (tables, columns, LLM-generated business terms)">
+                                                                {harvesting[c.id || c.name] ? <span className="spin">⟳</span> : '📥'} Harvest
+                                                            </button>
+                                                            {harvesting[c.id || c.name] && (
+                                                                <button className="btn btn-danger btn-sm" onClick={() => stopHarvest(c)} title="Stop harvest">⏹ Stop</button>
+                                                            )}
+                                                        </>
+                                                    )}
                                                     <button className="btn btn-ghost btn-sm" onClick={() => { setEditId(c.id || c.name); setForm({ ...c }); setShowForm(true); }}>✏️</button>
                                                     <button className="btn btn-danger btn-sm" onClick={() => confirmDel(c.id || c.name)}>🗑</button>
                                                 </div>
+                                                {(harvestMsg[c.id || c.name] || harvestStatus[c.id || c.name]) && (
+                                                    <div className="mt-1 text-xs space-y-0.5">
+                                                        {harvestMsg[c.id || c.name] && <div className="text-emerald-400">{harvestMsg[c.id || c.name]}</div>}
+                                                        {harvestStatus[c.id || c.name]?.status === 'idle' && harvestStatus[c.id || c.name]?.table_count > 0 && (
+                                                            <div className="text-slate-400">Last harvest: {harvestStatus[c.id || c.name].table_count} tables, {harvestStatus[c.id || c.name].columns_count || 0} columns{harvestStatus[c.id || c.name].last_harvest_at ? ' • ' + new Date(harvestStatus[c.id || c.name].last_harvest_at).toLocaleString() : ''}</div>
+                                                        )}
+                                                    </div>
+                                                )}
                                             </td>
                                         </tr>
                                         {testResult[c.id || c.name] && (
                                             <tr><td colSpan={4} className="pb-3">
                                                 <div className={`mx-4 p-3 rounded-lg text-xs mono ${testResult[c.id || c.name].status === 'success' ? 'bg-emerald-950/50 text-emerald-300' : 'bg-rose-950/50 text-rose-300'}`}>
                                                     {(testResult[c.id || c.name].logs || []).map((l, i) => <div key={i}>{l}</div>)}
+                                                </div>
+                                            </td></tr>
+                                        )}
+                                        {harvestStatus[c.id || c.name]?.logs?.length > 0 && (
+                                            <tr><td colSpan={4} className="pb-3">
+                                                <div className="mx-4 p-3 rounded-lg text-xs mono bg-slate-900/80 text-slate-300 border border-slate-700/50">
+                                                    <div className="font-semibold text-slate-400 mb-2">Harvest logs</div>
+                                                    <div className="max-h-32 overflow-y-auto space-y-1">
+                                                        {(harvestStatus[c.id || c.name].logs || []).map((l, i) => (
+                                                            <div key={i} className={typeof l === 'string' ? '' : (l.msg?.startsWith('Error') ? 'text-amber-400' : '')}>
+                                                                {typeof l === 'string' ? l : `[${l.ts}] ${l.msg}`}
+                                                            </div>
+                                                        ))}
+                                                    </div>
                                                 </div>
                                             </td></tr>
                                         )}

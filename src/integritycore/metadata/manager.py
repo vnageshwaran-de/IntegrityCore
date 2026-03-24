@@ -8,10 +8,25 @@ import json
 import logging
 import os
 import threading
+
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+
+# Load .env so GEMINI_API_KEY / GOOGLE_API_KEY are available for embeddings
+try:
+    from dotenv import load_dotenv
+    for p in (
+        Path(__file__).resolve().parent.parent.parent.parent / ".env",  # IntegrityCore/.env
+        Path.cwd() / ".env",
+        Path.cwd().parent / ".env",  # e.g. code/.env when run from IntegrityCore
+    ):
+        if p.exists():
+            load_dotenv(p)
+            break
+except ImportError:
+    pass
 
 from integritycore.metadata.models import (
     DistinctValueProfile,
@@ -33,22 +48,28 @@ def _ensure_base():
     _DEFAULT_BASE.mkdir(parents=True, exist_ok=True)
 
 
-# Google Gemini embedding model (via LiteLLM). Set GOOGLE_API_KEY or GEMINI_API_KEY.
+# Google Gemini embedding model (via LiteLLM). Uses GEMINI_API_KEY or GOOGLE_API_KEY from env.
 GOOGLE_EMBED_MODEL = "gemini/gemini-embedding-001"
-GOOGLE_EMBED_DIM = 768  # gemini-embedding-001 output dimension
+GOOGLE_EMBED_DIM = 768  # text-embedding-004 default output dimension
 
 
 def _get_embedding_function():
     """Return a function that takes a list of strings and returns list of vectors (for LanceDB). Uses Google Gemini embedding."""
     try:
-        import litellm
+        from litellm import embedding as litellm_embedding
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+
         def embed(texts: List[str]) -> List[List[float]]:
             if not texts:
                 return []
             try:
-                out = litellm.embed(model=GOOGLE_EMBED_MODEL, input=texts)
-                if hasattr(out, "data"):
-                    return [e["embedding"] for e in out.data]
+                kwargs = {"model": GOOGLE_EMBED_MODEL, "input": texts, "dimensions": GOOGLE_EMBED_DIM}
+                if api_key:
+                    kwargs["api_key"] = api_key
+                out = litellm_embedding(**kwargs)
+                data = getattr(out, "data", None) or (out.get("data") if isinstance(out, dict) else None)
+                if data:
+                    return [e["embedding"] for e in data]
                 if isinstance(out, list):
                     return [e["embedding"] for e in out]
                 return []
@@ -56,7 +77,8 @@ def _get_embedding_function():
                 log.warning("Google embedding failed, using zero vectors: %s", e)
                 return [[0.0] * GOOGLE_EMBED_DIM for _ in texts]
         return embed
-    except Exception:
+    except ImportError as e:
+        log.warning("litellm embedding not available: %s", e)
         def embed(texts: List[str]) -> List[List[float]]:
             return [[0.0] * GOOGLE_EMBED_DIM for _ in texts]
         return embed
@@ -93,8 +115,8 @@ class MetadataManager:
                 schema_name VARCHAR,
                 table_name VARCHAR,
                 table_comment VARCHAR,
-                columns_json CLOB,
-                constraints_json CLOB,
+                columns_json VARCHAR,
+                constraints_json VARCHAR,
                 last_crawled_at TIMESTAMP,
                 PRIMARY KEY (conn_id, schema_name, table_name)
             )
@@ -105,7 +127,7 @@ class MetadataManager:
                 schema_name VARCHAR,
                 table_name VARCHAR,
                 column_name VARCHAR,
-                sample_values_json CLOB,
+                sample_values_json VARCHAR,
                 distinct_count INTEGER,
                 is_categorical BOOLEAN,
                 PRIMARY KEY (conn_id, schema_name, table_name, column_name)
@@ -118,9 +140,9 @@ class MetadataManager:
                 table_name VARCHAR,
                 business_domain VARCHAR,
                 logical_description VARCHAR,
-                column_synonyms_json CLOB,
-                keywords_json CLOB,
-                raw_text CLOB,
+                column_synonyms_json VARCHAR,
+                keywords_json VARCHAR,
+                raw_text VARCHAR,
                 generated_at TIMESTAMP,
                 PRIMARY KEY (conn_id, schema_name, table_name)
             )
@@ -360,12 +382,14 @@ Return ONLY valid JSON: {{ "business_domain": "...", "logical_description": "...
         conn_id: str,
         schema: Optional[str] = None,
         progress_cb: Optional[Callable[[str], None]] = None,
+        cancel_check: Optional[Callable[[], bool]] = None,
         run_profiler: bool = True,
         model_name: str = "gemini/gemini-2.5-flash",
     ) -> int:
         """
         Introspect connection, store technical metadata, optionally run Semantic Profiler (LLM cards).
         Returns number of tables processed. Run in background thread to avoid blocking UI.
+        If cancel_check returns True, stops and returns count processed so far.
         """
         dialect = (getattr(conn, "dialect", "") or "").upper()
         if dialect == "SNOWFLAKE":
@@ -381,6 +405,10 @@ Return ONLY valid JSON: {{ "business_domain": "...", "logical_description": "...
             return 0
         count = 0
         for t in tables:
+            if cancel_check and cancel_check():
+                if progress_cb:
+                    progress_cb("Harvest cancelled by user")
+                return count
             if len(t) == 3:
                 db, sch, tbl = t[0], t[1], t[2]
             else:
@@ -395,6 +423,8 @@ Return ONLY valid JSON: {{ "business_domain": "...", "logical_description": "...
                     if progress_cb:
                         progress_cb(f"Crawled {sch}.{tbl}")
                 if run_profiler and meta:
+                    if progress_cb:
+                        progress_cb(f"Generating semantic card for {sch}.{tbl}...")
                     profiles = self._sample_distinct_values(introspector, meta)
                     card = self.generate_metadata_card(meta, profiles, model_name)
                     self.store_metadata_card(card)
@@ -402,7 +432,37 @@ Return ONLY valid JSON: {{ "business_domain": "...", "logical_description": "...
                 log.warning("Harvest error for %s.%s: %s", sch, tbl, e)
                 if progress_cb:
                     progress_cb(f"Error {sch}.{tbl}: {e}")
+            if cancel_check and cancel_check():
+                if progress_cb:
+                    progress_cb("Harvest cancelled by user")
+                return count
         return count
+
+    def get_harvest_stats(self, conn_id: str) -> Dict[str, Any]:
+        """Return harvest stats for a connection: table_count, columns_count, last_harvest_at."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT columns_json, last_crawled_at FROM table_metadata WHERE conn_id = ?",
+            (conn_id,),
+        ).fetchall()
+        if not rows:
+            return {"table_count": 0, "columns_count": 0, "last_harvest_at": None}
+        cols = 0
+        last_at = None
+        for r in rows:
+            try:
+                cols += len(json.loads(r[0] or "[]"))
+            except Exception:
+                pass
+            if r[1] and (last_at is None or r[1] > last_at):
+                last_at = r[1]
+        if last_at and hasattr(last_at, "isoformat"):
+            last_at = last_at.isoformat() + "Z" if (getattr(last_at, "tzinfo", None) is None) else last_at.isoformat()
+        return {
+            "table_count": len(rows),
+            "columns_count": cols,
+            "last_harvest_at": last_at,
+        }
 
     def _sample_distinct_values(self, introspector: BaseIntrospector, meta: TableMetadata) -> List[DistinctValueProfile]:
         """Extract distinct value profile for categorical-looking columns (e.g. VARCHAR with low cardinality)."""

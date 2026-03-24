@@ -42,6 +42,9 @@ class GroundingEngine:
         """
         # 1) Vector search
         hits = self.manager.search_by_semantics(user_prompt, conn_id=conn_id, top_k=top_k)
+        # Fallback: if no semantic match, try table/schema name match (e.g. "city" -> CITY schema)
+        if not hits and conn_id:
+            hits = self._fallback_table_match(user_prompt, conn_id, top_k)
         if not hits:
             return GroundingResult(
                 verified_schema_fragment="",
@@ -106,6 +109,68 @@ class GroundingEngine:
             closeness_matches=closeness_matches,
             metadata_cards=cards,
         )
+
+    def retrieve_single_table(
+        self, conn_id: str, schema_name: str, table_name: str
+    ) -> GroundingResult:
+        """Retrieve metadata for a single table (when user confirmed or LLM-parsed)."""
+        meta = self.manager.get_table_metadata(conn_id, schema_name, table_name)
+        if not meta:
+            # Fallback: search for table name across all schemas (e.g. "city" -> CITY.CITY_RAW)
+            tables = self.manager.list_tables(conn_id)
+            tbl_lower = table_name.lower()
+            for sch, tbl in tables:
+                if tbl and tbl.lower() == tbl_lower:
+                    meta = self.manager.get_table_metadata(conn_id, sch, tbl)
+                    if meta:
+                        schema_name, table_name = sch, tbl
+                        break
+        if not meta:
+            return GroundingResult(
+                verified_schema_fragment="",
+                semantic_mappings={},
+                related_tables=[],
+                confidence=0.0,
+                closeness_matches=[],
+            )
+        fragment = self._table_to_clean_ddl(meta)
+        card = self._get_card(conn_id, schema_name, table_name)
+        semantic_mappings: Dict[str, str] = {}
+        if card:
+            for col, syns in card.column_synonyms.items():
+                for s in syns:
+                    semantic_mappings[s.lower()] = f"{schema_name}.{table_name}.{col}"
+            semantic_mappings[card.business_domain.lower()] = f"{schema_name}.{table_name}"
+            for kw in card.keywords:
+                semantic_mappings[kw.lower()] = f"{schema_name}.{table_name}"
+        return GroundingResult(
+            verified_schema_fragment=fragment,
+            semantic_mappings=semantic_mappings,
+            related_tables=[f"{schema_name}.{table_name}"],
+            confidence=1.0,
+            closeness_matches=[],
+            metadata_cards=[card] if card else [],
+        )
+
+    def _fallback_table_match(self, user_prompt: str, conn_id: str, top_k: int) -> List[Tuple[str, str, str, float]]:
+        """When vector search fails, match prompt words to schema/table names (case-insensitive)."""
+        tables = self.manager.list_tables(conn_id)
+        words = set(w.lower().strip(".,;:!?") for w in user_prompt.split() if len(w) > 2)
+        if not words:
+            return []
+        matches: List[Tuple[str, str, str, float]] = []
+        for sch, tbl in tables:
+            score = 0.0
+            if sch and sch.lower() in words:
+                score += 0.5
+            if tbl and tbl.lower() in words:
+                score += 0.5
+            if f"{sch.lower()}.{tbl.lower()}" in words or f"{sch.lower()}_{tbl.lower()}" in words:
+                score = 1.0
+            if score > 0:
+                matches.append((conn_id, sch, tbl, 1.0 - score))
+        matches.sort(key=lambda x: x[3])
+        return matches[:top_k]
 
     def _get_card(self, conn_id: str, schema_name: str, table_name: str) -> Optional[MetadataCard]:
         """Load MetadataCard from DuckDB (manager has no get_metadata_card; we need to add or read from cards in retrieve)."""
